@@ -73,6 +73,7 @@ def build_model(
     temperature_rise: float,
     max_power: float,
     gaussian_exponent_scale: float = 1.0,
+    gate_offset: float = 0.5,
 ) -> tuple[GPiDoN, dict]:
     """Instantiate the network with normalisation baked in from the data statistics.
 
@@ -90,6 +91,7 @@ def build_model(
         temperature_offset=PROPERTIES.ambient_temperature,
         temperature_scale=temperature_rise,
         gaussian_exponent_scale=gaussian_exponent_scale,
+        gate_offset=gate_offset,
     )
     return GPiDoN(**architecture), architecture
 
@@ -130,6 +132,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "beam; >1 tightens the envelope, <1 widens it. The laser source term "
         "in the top BC is unaffected",
     )
+    parser.add_argument(
+        "--gate-offset",
+        type=float,
+        default=0.5,
+        help="initial value of the learnable `p` in the gate G = g + p; it is only "
+        "the starting point, training moves it",
+    )
     return parser.parse_args(argv)
 
 
@@ -154,7 +163,11 @@ def main(argv: list[str] | None = None) -> None:
     sampler = GPiDoNDataset(train_split, generator, domain=domain)
 
     model, architecture = build_model(
-        domain, temperature_rise, max_power, args.gaussian_exponent_scale
+        domain,
+        temperature_rise,
+        max_power,
+        args.gaussian_exponent_scale,
+        args.gate_offset,
     )
     model = model.to(device=device, dtype=dtype)
     scales = ResidualScales.characteristic(
@@ -181,6 +194,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[setup] lower={domain.lower.tolist()} upper={domain.upper.tolist()}")
     print(f"[setup] powers={corpus.powers.tolist()} W  T_rise={temperature_rise:.1f} K")
     print(f"[setup] gaussian_exponent_scale={args.gaussian_exponent_scale:g}")
+    print(f"[setup] gate_offset p0={args.gate_offset:g} (learnable)")
     print(
         f"[setup] scales temperature={scales.temperature:.4g} K "
         f"pde={scales.pde:.4g} W/m^3 flux={scales.flux:.4g} W/m^2"
@@ -219,15 +233,18 @@ def main(argv: list[str] | None = None) -> None:
         if iteration % args.log_every == 0 or iteration == 1:
             model.eval()
             rmse, worst = evaluate(model, val_split)
+            gate_offset = float(model.gate_offset.detach())
             writer.add_scalar("val/rmse", rmse, iteration)
             writer.add_scalar("val/max_error", worst, iteration)
+            writer.add_scalar("gate/offset", gate_offset, iteration)
 
             parts = " ".join(
                 f"{name}={value.detach().item():.3e}" for name, value in components.items()
             )
             progress.write(
                 f"[{iteration:6d}] total={total.detach().item():.4e} {parts} "
-                f"| val_rmse={rmse:7.3f}K val_max={worst:8.3f}K lr={scheduler.get_last_lr()[0]:.2e}"
+                f"| val_rmse={rmse:7.3f}K val_max={worst:8.3f}K p={gate_offset:+7.4f} "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
             improved = best.update(
                 rmse,
@@ -260,9 +277,11 @@ def main(argv: list[str] | None = None) -> None:
             "w_bc": weights.bc,
             "w_ic": weights.ic,
             "gaussian_exponent_scale": args.gaussian_exponent_scale,
+            "gate_offset_init": args.gate_offset,
         },
         {"hparam/val_rmse": best.best},
     )
     writer.close()
+    print(f"[done] learned gate offset p = {float(model.gate_offset.detach()):+.4f}")
     print(f"[done] best val RMSE {best.best:.3f} K -> {checkpoint_path}")
     print(f"[done] tensorboard --logdir {args.logdir}")

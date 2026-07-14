@@ -217,11 +217,28 @@ class GPiDoN(nn.Module):
     codes are combined by an inner product to predict the temperature
     ``T_hat(x, y, z, t; P)``.
 
-    That inner product is multiplied by :func:`~models.gpidon.laser.beam_gaussian`,
-    a unit-peak Gaussian riding on the moving beam, before the operator bias is
-    added. The temperature rise is concentrated around the beam by construction
-    rather than by fitting alone, and far from it the prediction relaxes to
-    ``temperature_offset`` plus the bias.
+    That inner product is multiplied by a gate before the operator bias is added::
+
+        T_hat = T_amb + dT * ( <branch(P), trunk(x,y,z,t)> * G + b )
+        G     = g(x, y, z, t) + p
+
+    ``g`` is :func:`~models.gpidon.laser.beam_gaussian`, a unit-peak Gaussian riding
+    on the moving beam, and ``p`` is a single learnable scalar -- the floor the gate
+    relaxes to away from the beam. This is the same ``G = g + p`` that
+    :class:`~models.gmlp.model.GatedMLP` gates its dense stack with.
+
+    The temperature rise is concentrated around the beam by construction rather
+    than by fitting alone. ``p`` is what keeps that from becoming a straitjacket:
+    with ``G = g`` alone the prediction is pinned to ``temperature_offset`` plus
+    the bias everywhere ``g`` has died off, which is everywhere beyond a beam
+    radius or two, making the diffused field and the trail behind the beam not
+    merely hard to fit but *unrepresentable*. With ``G = g + p`` the gate tends to
+    ``p`` far from the beam and the inner product is free to describe what is
+    there. ``p`` therefore reads directly as how far the fit had to back away from
+    the Gaussian prior.
+
+    ``p`` is constant in space and time, so it does not disturb the PDE residual:
+    it shifts the gate's value without adding a derivative of its own.
 
     The activation defaults to ``tanh`` because the PDE residual needs a
     non-vanishing second derivative; piecewise-linear activations such as
@@ -261,12 +278,18 @@ class GPiDoN(nn.Module):
         temperature_offset: float = 0.0,
         temperature_scale: float = 1.0,
         gaussian_exponent_scale: float = 1.0,
+        gate_offset: float = 0.5,
     ) -> None:
         """See the class docstring for the trunk/branch normalisation. ``gaussian_exponent_scale``
         is the ``k`` of the Gaussian gate applied in :meth:`forward`: ``k > 1`` tightens the
         envelope around the beam, ``k < 1`` widens it. It is registered as a buffer so the
         sharpness this checkpoint was trained with travels with it. The laser source term in
         ``models/gpidon/loss.laser_flux`` is unaffected -- it stays the calibrated Gaussian.
+
+        ``gate_offset`` is only the *initial* value of the learnable ``p`` in
+        ``G = g + p``; training moves it, and the trained value is what rides in the
+        state dict. It is a constructor argument rather than a buffer for that
+        reason -- the number worth carrying is the one learned, not the one guessed.
         """
         super().__init__()
         self.branch_input_dim = branch_input_dim
@@ -280,6 +303,8 @@ class GPiDoN(nn.Module):
             dropout=dropout,
             use_bias=use_bias,
         )
+        # The `p` of `G = g + p`: the floor the gate relaxes to away from the beam.
+        self.gate_offset = nn.Parameter(torch.tensor(float(gate_offset)))
 
         self.register_buffer(
             "coord_mean", _normalisation_buffer(coord_mean, self.trunk_input_dim, 0.0)
@@ -318,8 +343,10 @@ class GPiDoN(nn.Module):
         normalised_coords = (coords - self.coord_mean) / self.coord_scale
         normalised_power = (laser_power - self.branch_mean) / self.branch_scale
         # The gate is built from the physical coords, so autograd carries it into
-        # the derivatives the residuals in `loss.py` are written against.
-        gate = beam_gaussian(coords, self.gaussian_exponent_scale)
+        # the derivatives the residuals in `loss.py` are written against. `p` is a
+        # constant in space and time, so it shifts the gate without contributing a
+        # derivative of its own.
+        gate = beam_gaussian(coords, self.gaussian_exponent_scale) + self.gate_offset
         latent = self.operator(normalised_power, normalised_coords, gate=gate)
         return self.temperature_offset + self.temperature_scale * latent
 

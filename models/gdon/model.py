@@ -192,9 +192,30 @@ class GDoN(nn.Module):
 
     The branch network encodes the laser process parameter(s) ``P`` and the trunk
     network encodes the space-time query point ``(x, y, z, t)``. Their latent
-    codes are combined by an inner product, multiplied by
-    :func:`~models.gdon.laser.beam_gaussian` and offset by the operator bias, to
-    predict the temperature ``T_hat(x, y, z, t; P)``.
+    codes are combined by an inner product, multiplied by the gate and offset by
+    the operator bias, to predict the temperature ``T_hat(x, y, z, t; P)``::
+
+        T_hat = T_amb + dT * ( <branch(P), trunk(x,y,z,t)> * G + b )
+        G     = g(x, y, z, t) + p
+
+    ``g`` is :func:`~models.gdon.laser.beam_gaussian`, a unit-peak Gaussian riding
+    on the moving beam, and ``p`` is a single learnable scalar -- the floor the gate
+    relaxes to away from the beam. This is the same ``G = g + p`` that
+    :class:`~models.gmlp.model.GatedMLP` gates its dense stack with, and it is here
+    for the same reason.
+
+    ``p`` is what keeps the gate from being a straitjacket. With ``G = g`` alone the
+    prediction is pinned to ``temperature_offset`` plus the bias everywhere ``g``
+    has died off, which is everywhere beyond a beam radius or two; the diffused
+    field and the trail the beam drags behind it are then not merely hard to fit but
+    *unrepresentable*. With ``G = g + p`` the operator still gets the beam's shape
+    for free near the source, while far from it the gate tends to ``p`` and the
+    inner product is free to describe whatever is there. ``p`` therefore reads
+    directly as how far the fit had to back away from the Gaussian prior: at
+    ``p = 0`` this is the pure gate, and as ``p`` grows the gate flattens.
+
+    The operator bias ``b`` is added *after* the gate, so it is not gated along with
+    the inner product -- which is exactly where ``GatedMLP`` adds its own bias.
 
     The activation defaults to ``tanh`` to match :class:`~models.gpidon.model.GPiDoN`,
     so the two differ only in their objective. No residual is ever taken, so a
@@ -233,11 +254,17 @@ class GDoN(nn.Module):
         temperature_offset: float = 0.0,
         temperature_scale: float = 1.0,
         gaussian_exponent_scale: float = 1.0,
+        gate_offset: float = 0.5,
     ) -> None:
         """See the class docstring for the trunk/branch normalisation. ``gaussian_exponent_scale``
         is the ``k`` of the Gaussian gate applied in :meth:`forward`: ``k > 1`` tightens the
         envelope around the beam, ``k < 1`` widens it. It is registered as a buffer so the
         sharpness this checkpoint was trained with travels with it.
+
+        ``gate_offset`` is only the *initial* value of the learnable ``p`` in
+        ``G = g + p``; training moves it, and the trained value is what rides in the
+        state dict. It is a constructor argument rather than a buffer for that
+        reason -- the number worth carrying is the one learned, not the one guessed.
         """
         super().__init__()
         self.branch_input_dim = branch_input_dim
@@ -251,6 +278,8 @@ class GDoN(nn.Module):
             dropout=dropout,
             use_bias=use_bias,
         )
+        # The `p` of `G = g + p`: the floor the gate relaxes to away from the beam.
+        self.gate_offset = nn.Parameter(torch.tensor(float(gate_offset)))
 
         self.register_buffer(
             "coord_mean", _normalisation_buffer(coord_mean, self.trunk_input_dim, 0.0)
@@ -288,6 +317,6 @@ class GDoN(nn.Module):
 
         normalised_coords = (coords - self.coord_mean) / self.coord_scale
         normalised_power = (laser_power - self.branch_mean) / self.branch_scale
-        gate = beam_gaussian(coords, self.gaussian_exponent_scale)
+        gate = beam_gaussian(coords, self.gaussian_exponent_scale) + self.gate_offset
         latent = self.operator(normalised_power, normalised_coords, gate=gate)
         return self.temperature_offset + self.temperature_scale * latent
