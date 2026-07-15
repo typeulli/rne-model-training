@@ -30,10 +30,13 @@ from dataset import DEFAULT_DATA_DIR, Domain, SimulationDataset
 from utils import (
     DEFAULT_LOG_DIR,
     BestCheckpoint,
+    add_optimizer_args,
+    build_optimizer,
     count_parameters,
     make_run_name,
     resolve_checkpoint_path,
     resolve_device,
+    resolve_lr,
     resolve_run_dir,
 )
 
@@ -77,16 +80,23 @@ def build_model(
     max_power: float,
     gaussian_exponent_scale: float = 1.0,
     gate_offset: float = 0.5,
+    hidden_layers: tuple[int, ...] = (128, 128, 128, 128),
+    latent_dim: int = 128,
 ) -> tuple[GDoN, dict]:
     """Instantiate the network with normalisation baked in from the data statistics.
 
     The keyword dict is returned alongside so it can be stored in the checkpoint;
     ``agent.py`` rebuilds the network from it without re-reading the dataset.
+
+    ``hidden_layers`` sizes the branch and trunk subnetworks alike, so
+    ``--hidden 64 64 64`` puts this model at the same depth and width as
+    ``mlp``'s ``64x3``. ``latent_dim`` -- the width of the inner product the two
+    subnetworks meet in -- has no counterpart in a dense stack and is left alone.
     """
     architecture = dict(
         branch_input_dim=1,
-        hidden_layers=(128, 128, 128, 128),
-        latent_dim=128,
+        hidden_layers=tuple(hidden_layers),
+        latent_dim=latent_dim,
         coord_mean=domain.center.tolist(),
         coord_scale=domain.half_width.tolist(),
         branch_mean=[0.0],
@@ -103,7 +113,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--iterations", type=int, default=20000)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    add_optimizer_args(parser)
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        nargs="+",
+        default=[128, 128, 128, 128],
+        help="hidden layer widths of the branch and trunk subnetworks alike",
+    )
+    parser.add_argument(
+        "--latent-dim",
+        type=int,
+        default=128,
+        help="width of the inner product the branch and trunk meet in",
+    )
     parser.add_argument("--batch-data", type=int, default=4096)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--log-every", type=int, default=250, help="validation and console cadence")
@@ -164,12 +187,25 @@ def main(argv: list[str] | None = None) -> None:
         max_power,
         args.gaussian_exponent_scale,
         args.gate_offset,
+        hidden_layers=tuple(args.hidden),
+        latent_dim=args.latent_dim,
     )
     model = model.to(device=device, dtype=dtype)
     criterion = ScaledMSELoss(scale=temperature_rise)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations)
+    learning_rate = resolve_lr(args)
+    optimizer = build_optimizer(model.parameters(), args, learning_rate)
+    use_lbfgs = args.optimizer == "lbfgs"
+    # L-BFGS *requires* a fixed objective; adam merely allows one.
+    freeze_batch = use_lbfgs or args.freeze_batch
+    # L-BFGS descends one fixed function, so its batch is drawn once and reused;
+    # the strong-Wolfe line search sets the step, so there is no LR schedule.
+    scheduler = (
+        None
+        if use_lbfgs
+        else torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations)
+    )
+    fixed_batch = sampler.batch(args.lbfgs_batch) if freeze_batch else None
 
     run_name = args.run_name or make_run_name(MODEL_NAME, args.tag)
     run_dir = resolve_run_dir(args.logdir, run_name)
@@ -195,20 +231,33 @@ def main(argv: list[str] | None = None) -> None:
     )
     for iteration in progress:
         model.train()
-        optimizer.zero_grad(set_to_none=True)
 
-        power, coords, temperature = sampler.batch(args.batch_data)
-        loss = criterion(model(power, coords), temperature)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+        power, coords, temperature = (
+            fixed_batch if freeze_batch else sampler.batch(args.batch_data)
+        )
+
+        def closure():
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(power, coords), temperature)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            return loss
+
+        if use_lbfgs:
+            # L-BFGS re-evaluates the closure several times per step to run its
+            # line search, so it -- not the caller -- drives the loop.
+            loss = optimizer.step(closure)
+        else:
+            loss = closure()
+            optimizer.step()
+            scheduler.step()
 
         # .item() synchronises with the GPU, so only pull the scalars we log.
         if iteration % args.scalar_every == 0 or iteration == 1:
             value = loss.detach().item()
             writer.add_scalar("loss/data", value, iteration)
-            writer.add_scalar("lr", scheduler.get_last_lr()[0], iteration)
+            current_lr = learning_rate if scheduler is None else scheduler.get_last_lr()[0]
+            writer.add_scalar("lr", current_lr, iteration)
             progress.set_postfix(loss=f"{value:.3e}", best=f"{best.best:.1f}K")
 
         if iteration % args.log_every == 0 or iteration == 1:
@@ -222,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
             progress.write(
                 f"[{iteration:6d}] data={loss.detach().item():.4e} "
                 f"| val_rmse={rmse:7.3f}K val_max={worst:8.3f}K p={gate_offset:+7.4f} "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
+                f"lr={learning_rate if scheduler is None else scheduler.get_last_lr()[0]:.2e}"
             )
             improved = best.update(
                 rmse,
@@ -240,8 +289,11 @@ def main(argv: list[str] | None = None) -> None:
     progress.close()
     writer.add_hparams(
         {
-            "lr": args.lr,
+            "optimizer": args.optimizer,
+            "lr": learning_rate,
             "iterations": args.iterations,
+            "hidden": str(tuple(args.hidden)),
+            "latent_dim": args.latent_dim,
             "batch_data": args.batch_data,
             "gaussian_exponent_scale": args.gaussian_exponent_scale,
             "gate_offset_init": args.gate_offset,

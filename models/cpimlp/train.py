@@ -48,10 +48,14 @@ from dataset import DEFAULT_DATA_DIR, Domain, SimulationDataset
 from utils import (
     DEFAULT_LOG_DIR,
     BestCheckpoint,
+    add_optimizer_args,
+    build_optimizer,
     count_parameters,
+    load_checkpoint,
     make_run_name,
     resolve_checkpoint_path,
     resolve_device,
+    resolve_lr,
     resolve_run_dir,
 )
 
@@ -125,7 +129,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--iterations", type=int, default=20000)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    add_optimizer_args(parser)
     parser.add_argument(
         "--hidden", type=int, nargs="+", default=[256, 256, 256, 256], help="hidden layer widths"
     )
@@ -143,6 +147,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="defaults to checkpoints/cpimlp/<run-name>.pt",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help="warm-start from an existing checkpoint's weights before training; the "
+        "architecture (--hidden) must match. Used to continue an Adam-trained model "
+        "with L-BFGS instead of starting L-BFGS from a random init",
     )
     parser.add_argument("--logdir", type=Path, default=DEFAULT_LOG_DIR, help="TensorBoard output")
     parser.add_argument("--run-name", type=str, default=None, help="subdirectory under --logdir")
@@ -211,6 +223,10 @@ def main(argv: list[str] | None = None) -> None:
         gaussian_exponent_scale=args.gaussian_exponent_scale,
     )
     model = model.to(device=device, dtype=dtype)
+    if args.init_from is not None:
+        state = load_checkpoint(args.init_from, map_location=device)
+        model.load_state_dict(state["model"])
+        print(f"[setup] warm-started from {args.init_from} (val RMSE {state['val_rmse']:.3f} K)")
     # `peak_flux` is taken at the corpus maximum, not at `physics_power`, for the
     # same reason every other hyperparameter here is left alone: it is only a
     # non-dimensionalisation constant, and holding it equal to PiMLP's keeps the
@@ -224,8 +240,25 @@ def main(argv: list[str] | None = None) -> None:
     weights = LossWeights(data=args.w_data, pde=args.w_pde, bc=args.w_bc, ic=args.w_ic)
     criterion = PINNLoss(PROPERTIES, weights=weights, scales=scales)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations)
+    learning_rate = resolve_lr(args)
+    optimizer = build_optimizer(model.parameters(), args, learning_rate)
+    use_lbfgs = args.optimizer == "lbfgs"
+    # L-BFGS *requires* a fixed objective; adam merely allows one.
+    freeze_batch = use_lbfgs or args.freeze_batch
+    # L-BFGS estimates curvature from the gradients of previous steps, which is
+    # only meaningful if they all come from the same function. So the physics
+    # points -- normally resampled every iteration -- are drawn once and frozen,
+    # and the LR schedule is dropped: the strong-Wolfe line search sets the step.
+    scheduler = (
+        None
+        if use_lbfgs
+        else torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations)
+    )
+    fixed_batches = (
+        sampler.batches(args.batch_data, args.batch_physics, args.batch_boundary)
+        if freeze_batch
+        else None
+    )
 
     run_name = args.run_name or make_run_name(MODEL_NAME, args.tag)
     run_dir = resolve_run_dir(args.logdir, run_name)
@@ -259,16 +292,30 @@ def main(argv: list[str] | None = None) -> None:
     )
     for iteration in progress:
         model.train()
-        optimizer.zero_grad(set_to_none=True)
 
-        total, components = criterion(
-            model,
-            **sampler.batches(args.batch_data, args.batch_physics, args.batch_boundary),
+        batches = fixed_batches or sampler.batches(
+            args.batch_data, args.batch_physics, args.batch_boundary
         )
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+        parts: dict = {}
+
+        def closure():
+            optimizer.zero_grad(set_to_none=True)
+            total, components = criterion(model, **batches)
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            parts.clear()
+            parts.update(components)
+            return total
+
+        if use_lbfgs:
+            # L-BFGS re-evaluates the closure several times per step to run its
+            # line search, so it -- not the caller -- drives the loop.
+            total = optimizer.step(closure)
+        else:
+            total = closure()
+            optimizer.step()
+            scheduler.step()
+        components = parts
 
         # .item() synchronises with the GPU, so only pull the scalars we log.
         if iteration % args.scalar_every == 0 or iteration == 1:
@@ -276,7 +323,8 @@ def main(argv: list[str] | None = None) -> None:
             writer.add_scalar("loss/total", total_value, iteration)
             for name, value in components.items():
                 writer.add_scalar(f"loss/{name}", value.detach().item(), iteration)
-            writer.add_scalar("lr", scheduler.get_last_lr()[0], iteration)
+            current_lr = learning_rate if scheduler is None else scheduler.get_last_lr()[0]
+            writer.add_scalar("lr", current_lr, iteration)
             progress.set_postfix(loss=f"{total_value:.3e}", best=f"{best.best:.1f}K")
 
         if iteration % args.log_every == 0 or iteration == 1:
@@ -290,7 +338,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             progress.write(
                 f"[{iteration:6d}] total={total.detach().item():.4e} {parts} "
-                f"| val_rmse={rmse:7.3f}K val_max={worst:8.3f}K lr={scheduler.get_last_lr()[0]:.2e}"
+                f"| val_rmse={rmse:7.3f}K val_max={worst:8.3f}K lr={learning_rate if scheduler is None else scheduler.get_last_lr()[0]:.2e}"
             )
             improved = best.update(
                 rmse,
@@ -313,7 +361,8 @@ def main(argv: list[str] | None = None) -> None:
     progress.close()
     writer.add_hparams(
         {
-            "lr": args.lr,
+            "optimizer": args.optimizer,
+            "lr": learning_rate,
             "iterations": args.iterations,
             "hidden": str(tuple(args.hidden)),
             "batch_data": args.batch_data,

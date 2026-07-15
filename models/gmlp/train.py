@@ -31,10 +31,13 @@ from dataset import DEFAULT_DATA_DIR, SimulationDataset
 from utils import (
     DEFAULT_LOG_DIR,
     BestCheckpoint,
+    add_optimizer_args,
+    build_optimizer,
     count_parameters,
     make_run_name,
     resolve_checkpoint_path,
     resolve_device,
+    resolve_lr,
     resolve_run_dir,
 )
 
@@ -80,7 +83,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1000,
         help="batches per epoch; sampling is with replacement, so this is a free choice",
     )
-    parser.add_argument("--lr", type=float, default=1e-3)
+    add_optimizer_args(parser)
     parser.add_argument(
         "--hidden", type=int, nargs="+", default=[256, 256, 256, 256], help="hidden layer widths"
     )
@@ -147,8 +150,20 @@ def main(argv: list[str] | None = None) -> None:
     criterion = ScaledMSELoss(scale=temperature_rise)
 
     total_steps = args.epochs * args.steps_per_epoch
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    learning_rate = resolve_lr(args)
+    optimizer = build_optimizer(model.parameters(), args, learning_rate)
+    use_lbfgs = args.optimizer == "lbfgs"
+    # L-BFGS *requires* a fixed objective; adam merely allows one.
+    freeze_batch = use_lbfgs or args.freeze_batch
+    # L-BFGS descends one fixed function, so its batch is drawn once and reused;
+    # cosine-annealing its step size on top of the line search would only fight
+    # the line search, so the schedule is Adam's alone.
+    scheduler = (
+        None
+        if use_lbfgs
+        else torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    )
+    fixed_batch = sampler.batch(args.lbfgs_batch) if freeze_batch else None
 
     run_name = args.run_name or make_run_name(MODEL_NAME, args.tag)
     run_dir = resolve_run_dir(args.logdir, run_name)
@@ -180,21 +195,31 @@ def main(argv: list[str] | None = None) -> None:
         running = 0.0
         for _ in progress:
             step += 1
-            inputs, target = sampler.batch(args.batch_size)
+            inputs, target = fixed_batch if freeze_batch else sampler.batch(args.batch_size)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(inputs), target)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+            def closure() -> Tensor:
+                optimizer.zero_grad(set_to_none=True)
+                loss = criterion(model(inputs), target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                return loss
+
+            if use_lbfgs:
+                # L-BFGS re-evaluates the closure several times per step to run
+                # its line search, so it -- not the caller -- drives the loop.
+                loss = optimizer.step(closure)
+            else:
+                loss = closure()
+                optimizer.step()
+                scheduler.step()
 
             # .item() synchronises with the GPU, so only pull the scalars we log.
             if step % args.scalar_every == 0 or step == 1:
                 value = loss.detach().item()
                 running = value
+                current_lr = learning_rate if scheduler is None else scheduler.get_last_lr()[0]
                 writer.add_scalar("loss/train", value, step)
-                writer.add_scalar("lr", scheduler.get_last_lr()[0], step)
+                writer.add_scalar("lr", current_lr, step)
                 progress.set_postfix(loss=f"{value:.3e}", best=f"{best.best:.1f}K")
         progress.close()
 
@@ -215,18 +240,20 @@ def main(argv: list[str] | None = None) -> None:
             },
             step=step,
         )
+        current_lr = learning_rate if scheduler is None else scheduler.get_last_lr()[0]
         print(
             f"[epoch {epoch:3d}/{args.epochs}] train={running:.4e} "
             f"val_rmse={rmse:8.3f}K val_max={worst:9.3f}K p={gate_offset:+7.4f} "
-            f"lr={scheduler.get_last_lr()[0]:.2e}{'  *' if improved else ''}"
+            f"lr={current_lr:.2e}{'  *' if improved else ''}"
         )
 
     writer.add_hparams(
         {
-            "lr": args.lr,
+            "optimizer": args.optimizer,
+            "lr": learning_rate,
             "epochs": args.epochs,
             "steps_per_epoch": args.steps_per_epoch,
-            "batch_size": args.batch_size,
+            "batch_size": args.lbfgs_batch if use_lbfgs else args.batch_size,
             "hidden": str(tuple(args.hidden)),
             "gaussian_exponent_scale": args.gaussian_exponent_scale,
             "gate_offset_init": args.gate_offset,

@@ -38,6 +38,89 @@ def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Optimizers
+# ---------------------------------------------------------------------------
+
+OPTIMIZERS = ("adam", "lbfgs")
+
+# Adam wants a small step; L-BFGS with a strong-Wolfe line search wants a full
+# one, and the line search shortens it when that overshoots. Feeding L-BFGS
+# Adam's 1e-3 would cripple it, so the default depends on which one is chosen.
+DEFAULT_LR = {"adam": 1e-3, "lbfgs": 1.0}
+
+
+def add_optimizer_args(parser: Any) -> None:
+    """Register ``--optimizer`` and its L-BFGS knobs on a model's parser.
+
+    ``--lr`` defaults to ``None`` and is resolved by :func:`resolve_lr`, so that
+    each optimizer gets the step size that suits it while an explicit ``--lr``
+    still wins.
+    """
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZERS,
+        default="adam",
+        help="adam (stochastic, resampled batches) or lbfgs (quasi-Newton, fixed batch)",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help=f"step size; defaults per optimizer: {DEFAULT_LR}",
+    )
+    parser.add_argument(
+        "--lbfgs-batch",
+        type=int,
+        default=65536,
+        help="rows in the ONE batch L-BFGS is fitted against (supervised-MSE models "
+        "only; the PINN models freeze their own --batch-data/-physics/-boundary "
+        "point sets instead)",
+    )
+    parser.add_argument(
+        "--freeze-batch",
+        action="store_true",
+        help="draw the batch ONCE and reuse it, even with adam. L-BFGS always does "
+        "this; the flag exists so the batch and the optimizer can be varied "
+        "independently, which is the only way to tell which one an effect belongs to",
+    )
+    parser.add_argument("--lbfgs-history", type=int, default=100)
+    parser.add_argument("--lbfgs-max-iter", type=int, default=20)
+
+
+def resolve_lr(args: Any) -> float:
+    """``args.lr`` if given, else the default for ``args.optimizer``."""
+    if getattr(args, "lr", None) is not None:
+        return float(args.lr)
+    return DEFAULT_LR[getattr(args, "optimizer", "adam")]
+
+
+def build_optimizer(parameters: Any, args: Any, lr: float) -> torch.optim.Optimizer:
+    """Adam, or L-BFGS with a strong-Wolfe line search.
+
+    L-BFGS is a quasi-Newton method: it approximates the curvature of the loss
+    from the gradients of the *previous* steps. That approximation is only
+    meaningful if every step differs from the last by the parameters alone --
+    if the batch is resampled each step, consecutive gradients come from
+    different functions and the curvature history becomes noise. Every training
+    loop here therefore draws a single fixed batch of ``--lbfgs-batch`` rows and
+    reuses it, so the objective L-BFGS descends is one fixed function.
+
+    The price is that the fixed batch is the only data the model sees, so it can
+    overfit to it; the validation split is untouched by the choice and remains
+    the honest score.
+    """
+    if args.optimizer == "lbfgs":
+        return torch.optim.LBFGS(
+            parameters,
+            lr=lr,
+            history_size=args.lbfgs_history,
+            max_iter=args.lbfgs_max_iter,
+            line_search_fn="strong_wolfe",
+        )
+    return torch.optim.Adam(parameters, lr=lr)
+
+
+# ---------------------------------------------------------------------------
 # Run naming
 # ---------------------------------------------------------------------------
 

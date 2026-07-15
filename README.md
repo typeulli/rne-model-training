@@ -127,21 +127,23 @@ magnitude.
 ## Controls — `cmlp`, `cgmlp`, `cpimlp`
 
 The three above with the laser power **removed from the network's inputs** and
-nothing else changed: same stack, same activation, same objective, same
-hyperparameters, same rows drawn from the same corpus.
+nothing else changed: same stack, same activation, same objective.
 
-They exist to measure what `P` is worth. The corpus holds seven powers, and the
-same `(x, y, z, t)` carries a different temperature in each of them, so a network
-that cannot see `P` cannot resolve which one it is being asked about — the best it
+By default (the full seven-power corpus) this costs a lot: the same
+`(x, y, z, t)` carries a different temperature at each power, so a network that
+cannot see `P` cannot resolve which one it is being asked about, and the best it
 can do is the power-averaged field. That average is a hard floor:
 
 ```
-RMSE floor = 12.821 K      # the best ANY P-blind model can achieve on this corpus
+RMSE floor = 12.821 K      # the best ANY P-blind model can achieve on the full corpus
 ```
 
-`cmlp` and `cgmlp` land within a few tenths of a Kelvin of it, which is the point:
-they have learned everything learnable from the coordinates alone, and they fail
-*only* because `P` is missing.
+**The checkpoints currently in `checkpoints/{cmlp,cgmlp,cpimlp}/` are not that
+experiment, though.** They are trained and validated on a single power (175 W)
+instead, so `P` is constant within the split and carries no information to lose
+in the first place — the question these three now answer is not "how much does
+`P`-blindness cost against a floor" but "does dropping an input that never varies
+cost anything at all." See Results, below, for the numbers.
 
 ### `cmlp` / `cgmlp`
 
@@ -176,9 +178,14 @@ the physics a checkpoint was fitted against travels with its weights.
 This looks like it should tear the model in two — physics at 175 W, data averaged
 over all seven powers. In practice it very nearly does not, because `T` is close
 to linear in `P`, so the power-average field and the 175 W field are almost the
-same thing (they differ by 0.1 K RMSE). The choice is therefore close to optimal,
-and `cpimlp`'s remaining gap to the floor is the ordinary PINN optimisation
-penalty rather than that conflict.
+same thing (they differ by 0.1 K RMSE) when the corpus is the default seven
+powers.
+
+The checkpoint in `checkpoints/cpimlp/`, however, is trained on the single 175 W
+file, so the tension is not merely small there — it is exactly zero. The data
+term and the physics term describe the identical experiment by construction, and
+whatever gap remains to a perfect fit is the ordinary PINN optimisation penalty,
+nothing else.
 
 ---
 
@@ -234,6 +241,13 @@ python train.py mlp    --epochs 20 --batch-size 8192
 python train.py cgmlp  --hidden 64 64 64 --tag 64x3
 python train.py cpimlp --iterations 20000 --physics-power 175
 python train.py gpidon --help
+
+# a directory holding only one power's .npy trains/validates on that power alone
+python train.py cgmlp --data-dir /path/to/only-175W --tag 175W
+
+# L-BFGS needs a fixed objective; --init-from continues an Adam checkpoint with it
+python train.py mlp  --optimizer lbfgs --lbfgs-full --epochs 5 --steps-per-epoch 15
+python train.py cmlp --optimizer lbfgs --init-from checkpoints/cmlp/<adam-checkpoint>.pt
 ```
 
 A model is any directory under `models/` containing a `train.py` that exposes
@@ -246,32 +260,104 @@ their physics batches are resampled every step and there is no pass over the dat
 to speak of. Both write TensorBoard scalars to `runs/` and keep the single best
 checkpoint by validation RMSE under `checkpoints/<model>/<run-name>.pt`.
 
+Every model also takes `--optimizer {adam,lbfgs}` (`utils.add_optimizer_args`).
+L-BFGS estimates curvature from consecutive gradients, which is only meaningful if
+consecutive steps come from the same function, so whenever it is selected the
+batch is drawn once and reused, never resampled. Three flags control what that
+fixed objective is:
+
+- `--lbfgs-batch` (default 65 536) — the ONE sample L-BFGS is fitted against,
+  drawn once at the start of training.
+- `--lbfgs-full` (`mlp` only, for now) — the fixed objective is the *entire*
+  train split rather than a `--lbfgs-batch` sample of it, streamed through the
+  closure in `--lbfgs-batch`-sized chunks and gradient-accumulated so the result
+  is mathematically identical to a true full-batch step, not an approximation.
+  Much slower per step; see Results for what it buys.
+- `--init-from <checkpoint>` — warm-start from another checkpoint's weights
+  before training (the architecture must match). Used to continue an
+  Adam-trained model with L-BFGS instead of starting L-BFGS from a random init.
+
 ## Results
 
-Validation RMSE in Kelvin, on a random 10% row split. Measured at the **64×3**
-architecture (~8.7k parameters), the one size at which every dense model has been
-run and the numbers are therefore comparable:
+Validation RMSE in Kelvin. These numbers are read off whatever checkpoint is
+currently in `checkpoints/<model>/`; retraining any model overwrites the number,
+not the code, so treat this section as a snapshot rather than a guarantee.
 
-| | with `P` | without `P` |
+### `mlp` / `gmlp` / `pimlp` at 64×3
+
+The one size every `P`-aware dense model has been run at (~8.7k parameters),
+trained on the default seven-power corpus:
+
+| model | val RMSE |
+|---|---|
+| `mlp` | **2.568** |
+| `gmlp` | **2.396** |
+| `pimlp` | **4.160** |
+
+The `pimlp-64x3` checkpoint was trained on a longer schedule than the other two
+(best at step 36 500, versus 20 000), so it is not an exactly matched comparison.
+The operator nets are absent from this table because their size is hardcoded to
+128×4 / latent 128 — they have no `--hidden` flag, so they cannot be run at 64×3
+at all; see their own table below. `gmlp` at 256×4 reaches **0.630 K** — larger
+dense models help on the `P`-aware side.
+
+### Operator nets, at their own size (128×4 / latent 128, no `--hidden`)
+
+| model | val RMSE | learned `p` |
 |---|---|---|
-| plain | `mlp` **2.568** | `cmlp` **13.388** |
-| gated | `gmlp` **2.396** | `cgmlp` **13.187** |
-| physics | `pimlp` **4.160** | `cpimlp` **16.414** |
+| `gdon` (data MSE) | **2.950 K** | +0.449 |
+| `gpidon` (PINN) | **11.678 K** | +1.269 |
 
-against a P-blind floor of **12.821 K**. Withholding the process parameter costs
-roughly 5× the error and puts the controls flat against the information-theoretic
-limit — they are not undertrained, they are starved.
+The gate offset earns its keep here. `gdon` with a bare `g` gate scored 27.298 K:
+it fit the beam peak well but predicted ambient everywhere the Gaussian had died
+off, so the long thermal trail behind the beam was simply absent — errors of
+−348 K across most of the plate. Adding the learnable floor `p` cut that to
+2.950 K. The PINN variant tells the opposite story: `gpidon` drives `p` up to
++1.269, flattening the gate far more than `gdon` does, recovers the trail — and
+then blunts the peak, undershooting it by ~600 K. Its residuals evidently prefer a
+smooth field to a sharp one.
 
-Two caveats on this table. The `pimlp-64x3` checkpoint was trained on a longer
-schedule than the others (best at step 36 500, versus 20 000 for the rest), so its
-comparison with `cpimlp` is the one pair that is not exactly matched. And the
-operator-net checkpoints on disk are at a different size (128×4, latent 128) and
-so do not belong in it; `gpidon`'s current checkpoint is from an aborted run
-(best at step 1) and is effectively untrained.
+### Controls, single-power (175 W)
 
-Larger dense models do better on the `P`-aware side — `gmlp` at 256×4 reaches
-0.630 K — while the controls barely move (`cmlp` at 256×4: 12.916 K), which is
-what a floor looks like.
+The `checkpoints/{cmlp,cgmlp,cpimlp}/` checkpoints are trained **and validated**
+on `data_175W.npy` alone (see the Controls section above), not the seven-power
+default. `cpimlp`'s `--physics-power` is pinned to the same 175 W, so its physics
+and data terms describe one experiment with no residual conflict.
+
+| optimizer | `cmlp` | `cgmlp` | `cpimlp` |
+|---|---|---|---|
+| adam (`--hidden 64 64 64`) | **1.500** | **1.467** | 10.734 |
+| lbfgs, warm-started from the adam checkpoint above | 1.500 | 1.489 | **4.800** |
+
+Two things to read off this, and one thing *not* to. `cmlp`/`cgmlp` reach ~1.5 K
+on a single power — in the same range as `mlp`/`gmlp` at 64×3 on the full corpus
+(2.568 / 2.396 K) — which is consistent with dropping an input that never varies
+costing close to nothing, but it is not a controlled measurement of that:
+`mlp`/`gmlp` have not themselves been retrained on the 175 W-only split, so there
+is no same-corpus `P`-aware number to compare against here. What the row *does*
+show cleanly is L-BFGS's ceiling: warm-started from Adam, it is restricted to a
+fixed 65 536-row sample of the 175 W split (`--lbfgs-batch`, not `--lbfgs-full` —
+that flag exists only for `mlp` so far) and plateaus after its first epoch for
+`cmlp`/`cgmlp` — the line search finds nothing left to improve on that sample, so
+the remaining 19 configured epochs are all no-ops. `cpimlp`'s Adam checkpoint was
+further from convergence to begin with, so the same warm-start still buys a real
+improvement, 10.734 -> 4.800 K.
+
+### `mlp`, full-batch L-BFGS (256×4)
+
+`--lbfgs-full` makes the fixed objective L-BFGS descends the *entire* train split
+(8 317 260 rows across all seven powers) rather than a `--lbfgs-batch` sample of
+it, gradient-accumulated through the closure in chunks so the result is exact,
+not approximate:
+
+| steps | val RMSE |
+|---|---|
+| 20 | 19.919 |
+| 75 | **9.811** |
+
+Still descending at 75 steps (the last few epochs improved val RMSE by
+0.2–0.4 K each), so this is not a converged number, and there is currently no
+Adam checkpoint at the same 256×4 size on disk to compare it against directly.
 
 ## What is not here yet
 
