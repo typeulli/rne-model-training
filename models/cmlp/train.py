@@ -63,6 +63,16 @@ AMBIENT_TEMPERATURE = 298.0
 # silently editing the source data.
 CLIP_SUBAMBIENT = False
 
+# Hidden-layer activations selectable from the command line. The chosen class is
+# stored in the architecture dict, so the agent rebuilds the network with the same
+# one rather than the constructor default.
+ACTIVATIONS = {
+    "silu": torch.nn.SiLU,
+    "sigmoid": torch.nn.Sigmoid,
+    "tanh": torch.nn.Tanh,
+    "relu": torch.nn.ReLU,
+}
+
 
 @torch.no_grad()
 def evaluate(
@@ -93,6 +103,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_optimizer_args(parser)
     parser.add_argument(
         "--hidden", type=int, nargs="+", default=[256, 256, 256, 256], help="hidden layer widths"
+    )
+    parser.add_argument(
+        "--activation",
+        choices=tuple(ACTIVATIONS),
+        default="silu",
+        help="hidden-layer activation; stored in the checkpoint so the agent "
+        "rebuilds the network with the same one",
     )
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--scalar-every", type=int, default=25, help="TensorBoard loss cadence")
@@ -140,6 +157,7 @@ def main(argv: list[str] | None = None) -> None:
     input_mean, input_scale = sampler.normalisation()
     architecture = dict(
         hidden_layers=tuple(args.hidden),
+        activation=ACTIVATIONS[args.activation],
         input_mean=input_mean,
         input_scale=input_scale,
         temperature_offset=AMBIENT_TEMPERATURE,
@@ -181,7 +199,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[setup] powers={corpus.powers.tolist()} W  T_rise={temperature_rise:.1f} K")
     print("[setup] P is NOT an input: the model sees (t, z, y, x) and must average over them")
     print(f"[setup] train={len(train_split)} val={len(val_split)}")
-    print(f"[setup] optimizer={args.optimizer} lr={learning_rate:g}")
+    print(f"[setup] optimizer={args.optimizer} lr={learning_rate:g} activation={args.activation}")
     if use_lbfgs:
         print(
             f"[setup] L-BFGS on ONE fixed batch of {args.lbfgs_batch} rows "
@@ -261,6 +279,7 @@ def main(argv: list[str] | None = None) -> None:
             "steps_per_epoch": args.steps_per_epoch,
             "batch_size": args.lbfgs_batch if use_lbfgs else args.batch_size,
             "hidden": str(tuple(args.hidden)),
+            "activation": args.activation,
         },
         {"hparam/val_rmse": best.best},
     )

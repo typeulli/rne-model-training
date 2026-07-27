@@ -76,6 +76,16 @@ MODEL_NAME = "cpimlp"
 # silently editing the source data.
 CLIP_SUBAMBIENT = False
 
+# Hidden-layer activations selectable from the command line. The chosen class is
+# stored in the architecture dict, so the agent rebuilds the network with the same
+# one rather than the constructor default. Every one here has a non-vanishing
+# second derivative, which the PDE residual needs (ReLU would zero the Laplacian).
+ACTIVATIONS = {
+    "silu": torch.nn.SiLU,
+    "sigmoid": torch.nn.Sigmoid,
+    "tanh": torch.nn.Tanh,
+}
+
 
 @torch.no_grad()
 def evaluate(
@@ -104,6 +114,7 @@ def build_model(
     physics_power: float,
     hidden_layers: tuple[int, ...] = (256, 256, 256, 256),
     gaussian_exponent_scale: float = 1.0,
+    activation: type[torch.nn.Module] = torch.nn.SiLU,
 ) -> tuple[ControlPhysicsMLP, dict]:
     """Instantiate the network with normalisation baked in from the data statistics.
 
@@ -115,6 +126,7 @@ def build_model(
     input_mean, input_scale = normalisation(domain)
     architecture = dict(
         hidden_layers=hidden_layers,
+        activation=activation,
         input_mean=input_mean,
         input_scale=input_scale,
         temperature_offset=PROPERTIES.ambient_temperature,
@@ -132,6 +144,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_optimizer_args(parser)
     parser.add_argument(
         "--hidden", type=int, nargs="+", default=[256, 256, 256, 256], help="hidden layer widths"
+    )
+    parser.add_argument(
+        "--activation",
+        choices=tuple(ACTIVATIONS),
+        default="silu",
+        help="hidden-layer activation; stored in the checkpoint so the agent "
+        "rebuilds the network with the same one. All choices keep a non-zero "
+        "second derivative, which the PDE residual needs",
     )
     parser.add_argument("--batch-data", type=int, default=4096)
     parser.add_argument("--batch-physics", type=int, default=2048)
@@ -221,6 +241,7 @@ def main(argv: list[str] | None = None) -> None:
         physics_power,
         hidden_layers=tuple(args.hidden),
         gaussian_exponent_scale=args.gaussian_exponent_scale,
+        activation=ACTIVATIONS[args.activation],
     )
     model = model.to(device=device, dtype=dtype)
     if args.init_from is not None:
@@ -277,6 +298,7 @@ def main(argv: list[str] | None = None) -> None:
         f"(the laser flux the PDE/BC residuals are written against)"
     )
     print(f"[setup] gaussian_exponent_scale={args.gaussian_exponent_scale:g}")
+    print(f"[setup] activation={args.activation}")
     print(
         f"[setup] scales temperature={scales.temperature:.4g} K "
         f"pde={scales.pde:.4g} W/m^3 flux={scales.flux:.4g} W/m^2"
@@ -365,6 +387,7 @@ def main(argv: list[str] | None = None) -> None:
             "lr": learning_rate,
             "iterations": args.iterations,
             "hidden": str(tuple(args.hidden)),
+            "activation": args.activation,
             "batch_data": args.batch_data,
             "batch_physics": args.batch_physics,
             "batch_boundary": args.batch_boundary,
