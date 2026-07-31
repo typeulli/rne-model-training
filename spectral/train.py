@@ -80,6 +80,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", type=Path, required=True, help="a solver run under data/")
     ap.add_argument("--holdout", type=float, default=400.0, help="power kept out of training")
+    ap.add_argument("--exclude", type=int, default=0, metavar="N",
+                    help="drop the first N time steps. They go from the held-out power "
+                    "as well, so the score is quoted over the times that were fitted")
     ap.add_argument("--norm", choices=("global", "per-coef"), default="global")
     ap.add_argument("--derotate", action="store_true",
                     help="learn the coefficients in the frame that moves with the laser")
@@ -91,6 +94,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=20000)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--times", type=float, nargs="+", default=[0.5, 1.5, 3.0])
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tag", type=str, default=None, help="suffix on the archive entry")
     ap.add_argument("--lock", action="store_true", help="mark the archive entry read-only")
     a = ap.parse_args()
@@ -129,7 +133,13 @@ def main() -> None:
         Y = np.concatenate([Y, ramp.reshape(nP * nt, -1).astype(np.float64)], axis=1)
 
     test_p = int(np.argmin(np.abs(powers - a.holdout)))
-    tr = np.repeat(np.arange(nP) != test_p, nt)
+    if a.exclude >= nt:
+        raise SystemExit(f"--exclude {a.exclude} leaves none of the {nt} time steps")
+    # Two masks rather than one and its complement: the excluded steps belong to
+    # neither side, so `~tr` would quietly fold them into the held-out score.
+    keep_t = np.arange(nt) >= a.exclude
+    tr = ((np.arange(nP) != test_p)[:, None] & keep_t[None, :]).ravel()
+    ho = ((np.arange(nP) == test_p)[:, None] & keep_t[None, :]).ravel()
 
     if a.norm == "global":
         # one scale keeps the coefficients' relative sizes, so by Parseval the loss
@@ -141,8 +151,9 @@ def main() -> None:
     Xt = torch.tensor(X, dtype=torch.float32, device=dev)
     Yt = torch.tensor((Y - mu) / sd, dtype=torch.float32, device=dev)
     trt = torch.tensor(tr, device=dev)
+    hot = torch.tensor(ho, device=dev)
 
-    torch.manual_seed(0)
+    torch.manual_seed(a.seed)
     arch = dict(n_out=Y.shape[1], width=a.width, depth=a.depth)
     model = SpectralMLP(**arch).to(dev)
     model.set_normalisation(mu, sd)
@@ -156,8 +167,9 @@ def main() -> None:
         f"[archive] {entry.dir.name}\n"
         f"MLP 2 -> {' -> '.join([str(a.width)] * a.depth)} -> {Y.shape[1]}   "
         f"{n_par / 1e6:.1f}M params\n"
-        f"{int(tr.sum())} train samples, {nt} held out ({int(powers[test_p])} W), "
-        f"norm = {a.norm}, derotate = {a.derotate}\n"
+        f"{int(tr.sum())} train samples, {int(ho.sum())} held out "
+        f"({int(powers[test_p])} W), norm = {a.norm}, derotate = {a.derotate}, "
+        f"exclude = {a.exclude}\n"
     )
 
     t0 = time.time()
@@ -169,7 +181,7 @@ def main() -> None:
         sched.step()
         if ep % 100 == 0 or ep == a.epochs - 1:
             with torch.no_grad():
-                val = ((model(Xt[~trt]) - Yt[~trt]) ** 2).mean().item()
+                val = ((model(Xt[hot]) - Yt[hot]) ** 2).mean().item()
             writer.add_scalar("loss/train", loss.item(), ep)
             writer.add_scalar("loss/holdout", val, ep)
             if ep % 4000 == 0 or ep == a.epochs - 1:

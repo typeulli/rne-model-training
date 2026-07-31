@@ -274,6 +274,7 @@ def build(
     derotate: bool = True,
     speed: float = SCAN_SPEED,
     normalisation: str = "global",
+    exclude: int = 0,
     reference: FourierCorpus | None = None,
     verbose: bool = True,
 ) -> tuple[FourierCorpus, dict]:
@@ -282,8 +283,12 @@ def build(
     ``reference`` reuses another corpus's box and normalisation, which is what the
     held-out power must do: a validation set that chose its own box, or standardised
     itself by its own statistics, would not be measuring the same model.
+
+    ``exclude`` drops the first that many snapshots of every power. A sample here
+    is a whole snapshot, so this removes rows outright rather than thinning them;
+    the box is then chosen -- and the statistics taken -- on what is left.
     """
-    grids = [load_grid(path) for path in paths]
+    grids = [load_grid(path).exclude_initial_steps(exclude) for path in paths]
     fields = [temperature_rise(grid) for grid in grids]
     nt, nx, ny, nz = fields[0].shape
     spacing = grids[0].spacing[0]
@@ -362,13 +367,15 @@ def build(
     return corpus, architecture
 
 
-def bounds_of(path: Path) -> np.ndarray:
+def bounds_of(path: Path, exclude: int = 0) -> np.ndarray:
     """``[4, 2]`` of ``(lower, upper)`` for ``(x, y, z, t)``, from one file's axes.
 
     The agent needs the box it reconstructs on, and the grid axes settle it
     exactly -- so a checkpoint can be plotted without touching the corpus.
+    ``exclude`` matches :func:`build`, so the ``t`` bound recorded in a checkpoint
+    is the range the model was actually fitted over.
     """
-    grid = load_grid(path)
+    grid = load_grid(path).exclude_initial_steps(exclude)
     return np.array(
         [
             [grid.x[0], grid.x[-1]],

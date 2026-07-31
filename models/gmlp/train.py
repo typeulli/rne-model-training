@@ -39,6 +39,7 @@ from utils import (
     resolve_device,
     resolve_lr,
     resolve_run_dir,
+    seed_everything,
 )
 
 from .dataset import GMLPDataset
@@ -75,6 +76,14 @@ def evaluate(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--exclude",
+        type=int,
+        default=0,
+        metavar="N",
+        help="drop the first N time steps of the corpus before training. Applied "
+        "before the split, so they are absent from the validation half too",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument(
@@ -89,7 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--scalar-every", type=int, default=25, help="TensorBoard loss cadence")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--double", action="store_true", help="run in float64")
     parser.add_argument(
@@ -121,12 +130,14 @@ def main(argv: list[str] | None = None) -> None:
     dtype = torch.float64 if args.double else torch.float32
     torch.set_default_dtype(dtype)
     device = resolve_device(args.device)
+    seed_everything(args.seed)
 
     corpus = SimulationDataset.from_dir(
         args.data_dir,
         dtype=dtype,
         device=device,
         clip_below=AMBIENT_TEMPERATURE if CLIP_SUBAMBIENT else None,
+        exclude_steps=args.exclude,
     )
     domain = corpus.domain
     temperature_rise = corpus.temperature_rise(AMBIENT_TEMPERATURE)

@@ -7,10 +7,12 @@ network is an operator net or a convolutional surrogate.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,18 @@ def resolve_device(name: str | None = None) -> torch.device:
     if name is not None:
         return torch.device(name)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def seed_everything(seed: int) -> None:
+    """Seed the global RNG, the one a module's parameters are initialised from.
+
+    Every training loop already builds its own :class:`torch.Generator` from
+    ``--seed``, but that generator only covers the data -- the split and the
+    batches drawn from it. Weight initialisation reads the global generator
+    instead, so without this two runs at the same ``--seed`` would still start
+    from different weights and never be comparable.
+    """
+    torch.manual_seed(seed)
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
@@ -118,6 +132,202 @@ def build_optimizer(parameters: Any, args: Any, lr: float) -> torch.optim.Optimi
             line_search_fn="strong_wolfe",
         )
     return torch.optim.Adam(parameters, lr=lr)
+
+
+# ---------------------------------------------------------------------------
+# Gradient diagnostics
+# ---------------------------------------------------------------------------
+
+
+# every key :func:`_secant_metrics` can produce, by prefix
+_SECANT_PREFIXES = ("curv_", "cos_s_y_", "cos_y_", "dot_y_", "ynorm_", "snorm")
+
+
+def alignment_group(name: str) -> str:
+    """The TensorBoard group a :func:`gradient_alignment` key belongs in.
+
+    The first-order geometry stays under ``align/`` and everything the secant
+    family adds goes under ``align_curvature/``, so a run with
+    ``--align-curvature`` on presents them as two sections rather than one
+    48-item list. The prefixes cannot collide with the first-order names: no loss
+    term is called ``y``, so ``cos_y_``/``dot_y_`` are unambiguous, and
+    ``gnorm_`` is distinct from ``ynorm_``.
+    """
+    return "align_curvature" if name.startswith(_SECANT_PREFIXES) else "align"
+
+
+def _secant_metrics(
+    gradients: dict[str, torch.Tensor],
+    parameters: list[torch.nn.Parameter],
+    weights: Any,
+    previous: dict[str, Any],
+) -> dict[str, float]:
+    """How each term's gradient *changed* since the last call, against the step taken.
+
+    This is the second-order information L-BFGS itself runs on. It builds its
+    curvature estimate from pairs ``(s, y)`` -- the parameter step ``s = θ_k -
+    θ_{k-1}`` and the gradient change ``y = g_k - g_{k-1}`` -- and the update is
+    only guaranteed positive definite while ``sᵀy > 0``. Splitting ``y`` by loss
+    term says which term supplies that curvature and which one fights it.
+
+    ``previous`` is the caller's state dict, read and then overwritten in place;
+    the first call therefore returns nothing but the state for the second.
+
+    ``curv_<t>`` is ``sᵀy_t``, the per-term curvature condition, and
+    ``cos_s_y_<t>`` the same sign normalised into [-1, 1]. ``curv_total`` is the
+    weighted sum -- the quantity L-BFGS actually tests. ``cos_y_<a>_<b>`` and
+    ``dot_y_<a>_<b>`` are the pairwise geometry of the gradient *changes*, the
+    second-order counterpart of the first-order cosines.
+
+    Metrics whose denominator is zero are omitted rather than reported as 0.0: a
+    step that moved nothing leaves the cosines genuinely undefined, and a gap in
+    the series says that more honestly than a spurious "orthogonal".
+    """
+    current = nn.utils.parameters_to_vector(parameters).detach().clone()
+    last_gradients = previous.get("gradients")
+    last_parameters = previous.get("parameters")
+
+    metrics: dict[str, float] = {}
+    if last_gradients is not None and last_parameters is not None:
+        step = current - last_parameters
+        step_norm = float(step.norm())
+        metrics["snorm"] = step_norm
+
+        changes = {
+            term: gradient - last_gradients[term]
+            for term, gradient in gradients.items()
+            if term in last_gradients
+        }
+
+        for term, change in changes.items():
+            change_norm = float(change.norm())
+            curvature = float(torch.dot(step, change))
+            metrics[f"ynorm_{term}"] = change_norm
+            metrics[f"curv_{term}"] = curvature
+            if step_norm > 0.0 and change_norm > 0.0:
+                metrics[f"cos_s_y_{term}"] = curvature / (step_norm * change_norm)
+
+        for first, second in itertools.combinations(changes, 2):
+            a, b = changes[first], changes[second]
+            inner = float(torch.dot(a, b))
+            metrics[f"dot_y_{first}_{second}"] = inner
+            scale = float(a.norm()) * float(b.norm())
+            if scale > 0.0:
+                metrics[f"cos_y_{first}_{second}"] = inner / scale
+
+        if changes:
+            total = sum(
+                float(getattr(weights, term)) * change
+                for term, change in changes.items()
+            )
+            metrics["curv_total"] = float(torch.dot(step, total))
+
+    previous["gradients"] = {
+        term: gradient.detach().clone() for term, gradient in gradients.items()
+    }
+    previous["parameters"] = current
+    return metrics
+
+
+def gradient_alignment(
+    components: dict[str, torch.Tensor],
+    parameters: Iterable[torch.nn.Parameter],
+    weights: Any,
+    terms: tuple[str, ...] = ("data", "pde", "bc", "ic"),
+    previous: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """How a PINN's loss terms pull against each other in parameter space.
+
+    A PINN's objective is a sum of terms that need not agree. The direction the
+    data term wants to move the parameters and the direction the PDE residual
+    wants can oppose each other, and the sum is then a compromise neither asked
+    for. The loss values cannot show that -- two terms both falling says nothing
+    about whether they are fighting -- so each one is differentiated separately
+    here and the geometry of the results is reported.
+
+    ``components`` is the dict :meth:`PINNLoss.forward` returns alongside the
+    total; all four PINN models key it identically, which is why nothing here
+    needs to know which architecture produced it. ``weights`` is the run's
+    ``LossWeights``, read by attribute name for each of ``terms``.
+
+    Three families come out:
+
+    ``cos_<a>_<b>`` / ``dot_<a>_<b>``
+        The pairwise geometry, from the *unweighted* gradients. A negative
+        cosine is the interesting case: the two terms disagree about where to
+        go. Cosine is invariant to positive rescaling, so this is the terms'
+        own geometry and no choice of ``--w-*`` can change it.
+    ``gnorm_<t>`` / ``gnorm_weighted_<t>``
+        How big each term's gradient is on its own, and after its weight -- the
+        second being what the optimizer actually steps along. A term can be
+        negligible in the loss and still dominate the update.
+    ``cos_data_physics`` / ``norm_ratio_physics_data``
+        The data term against the sum of all the others, both weighted: one
+        number for "is the physics, as configured, opposing the fit?"
+
+    Pass a dict as ``previous`` -- the same one every call, initially empty -- to
+    add the second-order family from :func:`_secant_metrics`: how each term's
+    gradient changed since the last call, measured against the step the
+    parameters took. It costs nothing extra to compute but is only meaningful
+    when calls are close together, so the cadence should be small (1 for a
+    quasi-Newton run, where every step is already a line search).
+
+    Costs one backward pass per term on top of whatever the caller is already
+    doing, so it belongs behind a cadence flag rather than in every iteration.
+    ``torch.autograd.grad`` does not touch ``.grad``, so calling this leaves the
+    optimizer's state alone.
+    """
+    parameters = [p for p in parameters if p.requires_grad]
+
+    flat: dict[str, torch.Tensor] = {}
+    for term in terms:
+        value = components.get(term)
+        # A term whose point set was omitted is the forward's shared `zero`,
+        # which carries no graph; differentiating it raises rather than yielding
+        # a zero gradient, so it is dropped and its pairs are simply absent.
+        if value is None or not value.requires_grad:
+            continue
+        pieces = torch.autograd.grad(
+            value, parameters, retain_graph=True, allow_unused=True
+        )
+        flat[term] = torch.cat(
+            [
+                (torch.zeros_like(parameter) if piece is None else piece).reshape(-1)
+                for parameter, piece in zip(parameters, pieces)
+            ]
+        )
+
+    metrics: dict[str, float] = {}
+    for term, gradient in flat.items():
+        norm = float(gradient.norm())
+        metrics[f"gnorm_{term}"] = norm
+        metrics[f"gnorm_weighted_{term}"] = abs(float(getattr(weights, term))) * norm
+
+    def cosine(first: torch.Tensor, second: torch.Tensor) -> float:
+        scale = float(first.norm()) * float(second.norm())
+        return float(torch.dot(first, second)) / scale if scale > 0.0 else 0.0
+
+    for first, second in itertools.combinations(flat, 2):
+        metrics[f"dot_{first}_{second}"] = float(torch.dot(flat[first], flat[second]))
+        metrics[f"cos_{first}_{second}"] = cosine(flat[first], flat[second])
+
+    if "data" in flat and len(flat) > 1:
+        data = float(getattr(weights, "data")) * flat["data"]
+        physics = sum(
+            float(getattr(weights, term)) * gradient
+            for term, gradient in flat.items()
+            if term != "data"
+        )
+        metrics["cos_data_physics"] = cosine(data, physics)
+        data_norm = float(data.norm())
+        metrics["norm_ratio_physics_data"] = (
+            float(physics.norm()) / data_norm if data_norm > 0.0 else math.inf
+        )
+
+    if previous is not None:
+        metrics.update(_secant_metrics(flat, parameters, weights, previous))
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,13 @@ pool's peak height and width can be read off directly rather than inferred from
 a colour. One row per requested time: the profile on the left, the signed error
 on the right.
 
+Beneath them one panel scores the *whole* plane -- not just the line -- at every
+time step the solver stored. Three cuts at three instants cannot say whether the
+worst error sits off-axis, or lands between the times that happened to be
+plotted; this does, and the vertical rules mark which instants the rows above
+cut. The plane's peak temperature, solver and model, is overlaid on a second axis
+so the error can be read against the quantity it is an error in.
+
 The default ``--y 5.0`` is the scan line and the default depth is the top
 surface, which is where the laser deposits its energy and where the peak lives.
 
@@ -104,13 +111,60 @@ def fit_gaussian(
     return GaussianFit(float(amplitude), float(centre), abs(float(width)), r_squared, ambient)
 
 
+def layer_index(grid: Grid, depth: float | None) -> int:
+    """The ``z`` index the profiles are cut at; the top surface when ``depth`` is None."""
+    return len(grid.z) - 1 if depth is None else int(np.argmin(np.abs(grid.z - depth)))
+
+
+def surface_error_history(
+    grid: Grid, agent: BaseAgent, depth: float | None
+) -> tuple[np.ndarray, ...]:
+    """``(t, max_abs_error, rmse, peak_truth, peak_prediction)`` over the plane at ``depth``.
+
+    The rows above cut one line out of that plane at three chosen instants; this
+    scores the entire plane at *every* instant the solver stored. The worst error
+    on the surface need not sit on the scan line -- it can appear off-axis or at a
+    time between the sampled ones -- and a per-row maximum cannot show either.
+
+    The two peak temperatures ride along because the error alone cannot say what
+    it is an error *in*: a 150 K miss on a 1900 K melt pool and the same miss on a
+    400 K tail are different failures, and the peaks put the error next to the
+    quantity it is measured against.
+    """
+    layer = layer_index(grid, depth)
+    mesh_x, mesh_y = np.meshgrid(grid.x, grid.y, indexing="ij")
+    flat_x, flat_y = mesh_x.reshape(-1), mesh_y.reshape(-1)
+    height = np.full(flat_x.shape, grid.z[layer])
+
+    worst, rmse, peak_truth, peak_prediction = [], [], [], []
+    for index, time in enumerate(grid.t):
+        coords = np.stack(
+            [flat_x, flat_y, height, np.full(flat_x.shape, time)], axis=-1
+        )
+        # stored as [t, z, y, x]; the meshgrid above is (x, y), hence the transpose
+        truth = grid.temperature[index, layer].T.reshape(-1)
+        prediction = predict(agent, coords, grid.power)
+        error = prediction - truth
+        worst.append(float(np.abs(error).max()))
+        rmse.append(float(np.sqrt((error**2).mean())))
+        peak_truth.append(float(truth.max()))
+        peak_prediction.append(float(prediction.max()))
+    return (
+        grid.t,
+        np.array(worst),
+        np.array(rmse),
+        np.array(peak_truth),
+        np.array(peak_prediction),
+    )
+
+
 def line_coords(
     grid: Grid, time: float, track_y: float, depth: float | None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
     """Return ``(x[nx], coords[nx,4], truth[nx], actual)`` along the scan line."""
     time_index = int(np.argmin(np.abs(grid.t - time)))
     row = int(np.argmin(np.abs(grid.y - track_y)))
-    layer = len(grid.z) - 1 if depth is None else int(np.argmin(np.abs(grid.z - depth)))
+    layer = layer_index(grid, depth)
 
     coords = np.stack(
         [
@@ -140,15 +194,21 @@ def draw(
     ambient: float = AMBIENT_TEMPERATURE,
     beam_radius: float = BEAM_RADIUS * MM,
 ) -> Figure:
-    """Render one profile/error row per time and print per-row metrics."""
-    figure, axes = plt.subplots(
-        len(times),
-        2,
-        figsize=(12, 3.1 * len(times)),
-        squeeze=False,
-        sharex=True,
-        constrained_layout=True,
-    )
+    """Render one profile/error row per time, plus the surface-error history below."""
+    # GridSpec rather than plt.subplots: the history row spans both columns and is
+    # plotted against time, so it cannot share the x axis the rows above use.
+    figure = plt.figure(figsize=(12, 3.1 * len(times) + 2.7), constrained_layout=True)
+    spec = figure.add_gridspec(len(times) + 1, 2)
+    axes = np.empty((len(times), 2), dtype=object)
+    for row in range(len(times)):
+        for column in range(2):
+            axes[row, column] = figure.add_subplot(
+                spec[row, column],
+                sharex=None if row == 0 and column == 0 else axes[0, 0],
+            )
+            if row < len(times) - 1:
+                axes[row, column].tick_params(labelbottom=False)
+    history_axis = figure.add_subplot(spec[-1, :])
 
     # The cut is the same for every row, so name it once from the first probe.
     *_, placement = line_coords(grid, times[0], track_y, depth)
@@ -229,6 +289,71 @@ def draw(
     depth_label = (
         "top surface" if depth is None else f"z = {placement['z'] / MM:.2f} mm"
     )
+
+    history = surface_error_history(grid, agent, depth)
+    history_t, history_worst, history_rmse, peak_truth, peak_prediction = history
+    print(f"  {depth_label}, every stored time step:")
+    for values in zip(history_t, history_worst, history_rmse, peak_truth, peak_prediction):
+        time, worst_value, rmse_value, truth_peak, model_peak = values
+        print(
+            f"    t = {time:4.2f}s  max |error| = {worst_value:9.3f} K"
+            f"   RMSE = {rmse_value:8.3f} K"
+            f"   peak {truth_peak:7.1f} -> {model_peak:7.1f} K ({model_peak - truth_peak:+.1f})"
+        )
+
+    # Two scales in one panel: the error is tens of K, the temperature is
+    # hundreds. Errors keep the left axis, temperatures take the right, and the
+    # legend is merged so the pairing stays readable.
+    temperature_axis = history_axis.twinx()
+    error_lines = [
+        history_axis.plot(
+            history_t, history_worst, color=PREDICTION_COLOUR, linewidth=1.8,
+            marker="o", markersize=4, label="max |error|",
+        )[0],
+        history_axis.plot(
+            history_t, history_rmse, color=INK_SECONDARY, linewidth=1.4,
+            linestyle="--", marker="s", markersize=3, label="RMSE",
+        )[0],
+    ]
+    # Solid is the solver and dashed the model, the same pairing the rows above
+    # use, so line style carries it and colour is never the only cue.
+    temperature_lines = [
+        temperature_axis.plot(
+            history_t, peak_truth, color=TRUTH_COLOUR, linewidth=1.5,
+            label="peak T, simulation",
+        )[0],
+        temperature_axis.plot(
+            history_t, peak_prediction, color=TRUTH_COLOUR, linewidth=1.5,
+            linestyle="--", label=f"peak T, {model_name}",
+        )[0],
+    ]
+    # Tie the curves back to the rows above: these are the instants they cut.
+    for time in times:
+        nearest = float(history_t[int(np.argmin(np.abs(history_t - time)))])
+        history_axis.axvline(nearest, color=TRUTH_COLOUR, linewidth=0.9, alpha=0.45)
+    history_axis.set_xlabel("t [s]")
+    history_axis.set_ylabel("error over the plane [K]")
+    temperature_axis.set_ylabel("peak T on the plane [K]")
+    history_axis.set_title(
+        f"{depth_label}: error and peak temperature over the whole plane at every "
+        f"stored time (worst error {history_worst.max():.0f} K)",
+        fontsize=10,
+    )
+    # Below the axes rather than inside it: four curves on two scales leave no
+    # corner reliably free, and which corner is free changes with the model.
+    lines = error_lines + temperature_lines
+    history_axis.legend(
+        lines,
+        [line.get_label() for line in lines],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.28),
+        ncol=4,
+        frameon=False,
+        fontsize=8,
+    )
+    history_axis.grid(alpha=0.25, linewidth=0.6)
+    history_axis.spines[["top"]].set_visible(False)
+    temperature_axis.spines[["top"]].set_visible(False)
     figure.suptitle(
         f"P = {grid.power:.0f} W,  y = {placement['y'] / MM:.2f} mm ({depth_label})",
         fontsize=13,

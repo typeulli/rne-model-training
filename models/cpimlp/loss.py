@@ -259,10 +259,17 @@ def surrounding_bc_loss(
 
 
 def initial_condition_loss(
-    predicted: Tensor, properties: ThermalProperties, scale: float = 1.0
+    predicted: Tensor, target: Tensor, scale: float = 1.0
 ) -> Tensor:
-    """``L_IC = T_hat - T_amb`` at ``t = 0``."""
-    return _mean_squared(predicted - properties.ambient_temperature, scale)
+    """``L_IC = T_hat - T`` at the earliest time the domain spans.
+
+    ``target`` is the field the solver had there rather than ``T_amb``. The two
+    are the same thing when no time steps are excluded -- the run starts at
+    ambient -- but ``--exclude`` moves the earliest time forward into a field
+    that has already been heated, and ambient would then be a condition the data
+    term contradicts at the very same points.
+    """
+    return _mean_squared(predicted - target, scale)
 
 
 class PINNLoss(nn.Module):
@@ -348,9 +355,11 @@ class PINNLoss(nn.Module):
             )
 
         if initial is not None:
+            if initial.temperature is None:
+                raise ValueError("initial point set requires `temperature` targets")
             predicted = model(initial.coords)
             components["ic"] = initial_condition_loss(
-                predicted, properties, scales.temperature
+                predicted, initial.temperature, scales.temperature
             )
 
         components["bc"] = (

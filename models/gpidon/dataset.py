@@ -40,6 +40,11 @@ class GPiDoNDataset:
         # corpus's, so the caller can pin the domain to the full one.
         self.domain = domain if domain is not None else labelled.domain
         self.powers = labelled.powers
+        # The initial-condition term is anchored to the earliest time the domain
+        # spans and is fitted to the field the solver had there -- which exists
+        # only on the grid, so those rows are held aside here rather than being
+        # sampled from the box like every other unlabelled batch.
+        self.initial_slice = labelled.at_time(self.domain.lower[3])
 
     # -- helpers -------------------------------------------------------------
 
@@ -104,9 +109,16 @@ class GPiDoNDataset:
         )
 
     def initial(self, count: int) -> PointSet:
-        """The ``t = 0`` slab, held at ambient."""
-        coords = self.domain.face(axis=3, upper=False, count=count, generator=self.generator)
-        return PointSet(laser_power=self._power(count), coords=coords)
+        """The earliest time step, at the temperature the solver had there.
+
+        Without ``--exclude`` that is ``t = 0``, where the field is ambient and
+        this is the ``T = T_amb`` slab the term used to hard-code. With it, the
+        earliest step left has already been heated, so the target is read off the
+        data -- which is also why these rows are drawn from the corpus rather
+        than from the domain: there is no simulation value at an arbitrary point.
+        """
+        coords, power, temperature = self.initial_slice.sample(count, self.generator)
+        return PointSet(laser_power=power, coords=coords, temperature=temperature)
 
     def batches(
         self, batch_data: int, batch_physics: int, batch_boundary: int

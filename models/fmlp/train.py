@@ -113,6 +113,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument(
+        "--exclude",
+        type=int,
+        default=0,
+        metavar="N",
+        help="drop the first N snapshots of every power before training. A sample "
+        "here is a whole snapshot, so this removes rows outright; the held-out "
+        "power loses the same ones, and the box is chosen on what is left",
+    )
+    parser.add_argument(
         "--valid-dir",
         type=Path,
         default=DEFAULT_VALID_DIR,
@@ -164,7 +173,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--eval-every", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--double", action="store_true", help="run in float64")
     parser.add_argument(
@@ -195,11 +204,13 @@ def main(argv: list[str] | None = None) -> None:
         derotate=args.derotate,
         speed=args.scan_speed,
         normalisation=args.norm,
+        exclude=args.exclude,
     )
     # The held-out power reuses the training box and the training statistics: one
     # that chose its own would not be measuring the same model.
     valid, _ = build(valid_paths, reference=train, detrend=args.detrend,
-                     derotate=args.derotate, speed=args.scan_speed)
+                     derotate=args.derotate, speed=args.scan_speed,
+                     exclude=args.exclude)
 
     architecture["hidden_layers"] = tuple(args.hidden)
     architecture["input_scale"] = (
@@ -223,7 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     best = BestCheckpoint(checkpoint_path, mode="min")
     writer = SummaryWriter(log_dir=str(run_dir))
 
-    bounds = torch.tensor(bounds_of(train_paths[0]), dtype=dtype)
+    bounds = torch.tensor(bounds_of(train_paths[0], args.exclude), dtype=dtype)
     held = float(valid.powers[0])
     floor_rmse, floor_linf, floor_peak = score(valid.floor, valid.truth)
     kx, ky = train.box

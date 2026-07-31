@@ -107,6 +107,31 @@ class Grid:
         """``(D, H, W) = (nz, ny, nx)``."""
         return (self.z.size, self.y.size, self.x.size)
 
+    def exclude_initial_steps(self, count: int) -> "Grid":
+        """This grid without its first ``count`` time steps.
+
+        The ``t`` axis and the leading axis of ``temperature`` are cut together,
+        so the result is still a complete structured grid -- one that simply
+        starts later.
+        """
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        if count == 0:
+            return self
+        if count >= self.t.size:
+            raise ValueError(
+                f"cannot exclude {count} of the {self.t.size} time steps in {self.name}"
+            )
+        return Grid(
+            name=self.name,
+            x=self.x,
+            y=self.y,
+            z=self.z,
+            t=self.t[count:],
+            temperature=self.temperature[count:],
+            power=self.power,
+        )
+
 
 def load_grid(path: Path) -> Grid:
     """Reshape an ``[N, 6]`` file of ``(x, y, z, t, P, T)`` rows onto its grid."""
@@ -232,6 +257,7 @@ class SimulationDataset(Dataset):
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cpu",
         clip_below: float | None = None,
+        exclude_steps: int = 0,
         verbose: bool = True,
     ) -> "SimulationDataset":
         """Load and concatenate ``paths``.
@@ -240,6 +266,11 @@ class SimulationDataset(Dataset):
         (~5% of the corpus) are a solver artefact -- with heating only, ``T`` can
         never fall below ``T_amb`` -- but they are left untouched unless asked
         for, rather than silently editing the source data.
+
+        ``exclude_steps`` drops the first that many time steps; see
+        :meth:`exclude_initial_steps`. It is applied here, before the split, so
+        the excluded steps are absent from the validation half as well and the
+        domain the models derive from the corpus contracts with them.
         """
         if not paths:
             raise FileNotFoundError("no .npy files given")
@@ -276,7 +307,8 @@ class SimulationDataset(Dataset):
         def stack(blocks: list[np.ndarray]) -> Tensor:
             return torch.as_tensor(np.concatenate(blocks), dtype=dtype, device=device)
 
-        return cls(stack(coord_blocks), stack(power_blocks), stack(temperature_blocks))
+        dataset = cls(stack(coord_blocks), stack(power_blocks), stack(temperature_blocks))
+        return dataset.exclude_initial_steps(exclude_steps, verbose=verbose)
 
     @classmethod
     def from_dir(
@@ -310,6 +342,11 @@ class SimulationDataset(Dataset):
         return torch.unique(self.power)
 
     @property
+    def times(self) -> Tensor:
+        """The distinct sample times present, ascending -- the corpus's time steps."""
+        return torch.unique(self.coords[:, 3])
+
+    @property
     def max_power(self) -> float:
         return float(self.powers.max())
 
@@ -323,6 +360,52 @@ class SimulationDataset(Dataset):
         return SimulationDataset(
             self.coords[index], self.power[index], self.temperature[index]
         )
+
+    def exclude_initial_steps(
+        self, count: int, verbose: bool = False
+    ) -> "SimulationDataset":
+        """Every row except those of the first ``count`` time steps.
+
+        A time step is one distinct value of ``t``, not one row: the corpus is a
+        structured grid flattened, so a step carries ``nz * ny * nx`` rows at each
+        power and they are dropped together. The rows are all that is removed, so
+        :attr:`domain` -- which is read off the rows that remain -- starts at the
+        earliest step kept rather than at ``t = 0``.
+        """
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        if count == 0:
+            return self
+
+        times = self.times
+        if count >= times.numel():
+            raise ValueError(
+                f"cannot exclude {count} of the {times.numel()} time steps present"
+            )
+
+        # `cutoff` is one of the sampled times rather than a computed one, so the
+        # comparison is exact and needs no tolerance.
+        cutoff = times[count]
+        keep = self.coords[:, 3] >= cutoff
+        if verbose:
+            print(
+                f"[data] excluding the first {count} of {times.numel()} time steps "
+                f"(t < {float(cutoff):g} s): {int((~keep).sum())} rows dropped, "
+                f"{int(keep.sum())} kept"
+            )
+        return self.subset(keep)
+
+    def at_time(self, time: float | Tensor) -> "SimulationDataset":
+        """The rows sampled at exactly ``time``.
+
+        Compared exactly, which is safe because the caller takes ``time`` from
+        the data -- typically ``domain.lower[3]``, the earliest step present --
+        rather than computing it.
+        """
+        selected = self.subset(self.coords[:, 3] == time)
+        if len(selected) == 0:
+            raise ValueError(f"no rows at t = {float(time)} s")
+        return selected
 
     def split(
         self, val_fraction: float, generator: torch.Generator

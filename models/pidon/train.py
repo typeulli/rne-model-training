@@ -26,13 +26,16 @@ from utils import (
     DEFAULT_LOG_DIR,
     BestCheckpoint,
     add_optimizer_args,
+    alignment_group,
     build_optimizer,
     count_parameters,
+    gradient_alignment,
     make_run_name,
     resolve_checkpoint_path,
     resolve_device,
     resolve_lr,
     resolve_run_dir,
+    seed_everything,
 )
 
 from .dataset import PiDoNDataset
@@ -108,6 +111,17 @@ def build_model(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--exclude",
+        type=int,
+        default=0,
+        metavar="N",
+        help="drop the first N time steps of the corpus before training. Applied "
+        "before the split, so they are absent from the validation half too; the "
+        "domain contracts with them, which moves the initial-condition term onto "
+        "the earliest step left -- where it is fitted to the field the solver had "
+        "there rather than to ambient",
+    )
     parser.add_argument("--iterations", type=int, default=20000)
     add_optimizer_args(parser)
     parser.add_argument(
@@ -129,7 +143,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--log-every", type=int, default=250, help="validation and console cadence")
     parser.add_argument("--scalar-every", type=int, default=25, help="TensorBoard loss cadence")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--align-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="every N iterations, differentiate each loss term separately and log "
+        "the pairwise cosines and gradient norms under `align/`; 0 disables it. "
+        "Costs one extra backward pass per term when it fires, so it is off by "
+        "default. See utils.gradient_alignment",
+    )
+    parser.add_argument(
+        "--align-curvature",
+        action="store_true",
+        help="add the second-order family to --align-every: how each term's "
+        "gradient CHANGED since the last measurement, against the step the "
+        "parameters took. These are the (s, y) pairs L-BFGS builds its curvature "
+        "from, so `curv_<term>` (= s'y) shows which term supplies the positive "
+        "curvature the update needs and which one opposes it. Only meaningful at "
+        "a small --align-every",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--double", action="store_true", help="run in float64")
     parser.add_argument(
@@ -143,9 +177,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tag", type=str, default=None, help="label folded into the run name")
     parser.add_argument("--no-progress", action="store_true", help="disable the tqdm bar")
     parser.add_argument("--w-data", type=float, default=1.0)
-    parser.add_argument("--w-pde", type=float, default=1.0)
-    parser.add_argument("--w-bc", type=float, default=1.0)
-    parser.add_argument("--w-ic", type=float, default=1.0)
+    parser.add_argument("--w-pde", type=float, default=1e-4)
+    parser.add_argument("--w-bc", type=float, default=1e-4)
+    parser.add_argument("--w-ic", type=float, default=1e-4)
     parser.add_argument(
         "--gaussian-exponent-scale",
         type=float,
@@ -153,7 +187,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="multiplies the exponent of the top-surface laser gaussian; "
         ">1 narrows the assumed source, <1 broadens it",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.align_curvature and args.align_every <= 0:
+        parser.error("--align-curvature requires --align-every")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -161,12 +198,14 @@ def main(argv: list[str] | None = None) -> None:
     dtype = torch.float64 if args.double else torch.float32
     torch.set_default_dtype(dtype)
     device = resolve_device(args.device)
+    seed_everything(args.seed)
 
     corpus = SimulationDataset.from_dir(
         args.data_dir,
         dtype=dtype,
         device=device,
         clip_below=PROPERTIES.ambient_temperature if CLIP_SUBAMBIENT else None,
+        exclude_steps=args.exclude,
     )
     domain = corpus.domain
     max_power = corpus.max_power
@@ -180,6 +219,24 @@ def main(argv: list[str] | None = None) -> None:
         domain=domain,
         gaussian_exponent_scale=args.gaussian_exponent_scale,
     )
+    # One batch, drawn once and reused for every measurement, so the only thing
+    # moving in the `align/` series is the parameters. Its generator is separate
+    # from the training one: --align-every has to be an observer, and sharing the
+    # stream would make the batches training draws depend on whether it is on.
+    probe_batches = None
+    if args.align_every > 0:
+        probe_sampler = PiDoNDataset(
+            train_split,
+            torch.Generator(device=device).manual_seed(args.seed + 1),
+            domain=domain,
+            gaussian_exponent_scale=args.gaussian_exponent_scale,
+        )
+        probe_batches = probe_sampler.batches(
+            args.batch_data, args.batch_physics, args.batch_boundary
+        )
+    # Carried across measurements so each one can be compared with the last; see
+    # utils._secant_metrics. None keeps the probe first-order only.
+    probe_state = {} if (probe_batches is not None and args.align_curvature) else None
 
     model, architecture = build_model(
         domain,
@@ -246,6 +303,49 @@ def main(argv: list[str] | None = None) -> None:
     )
     for iteration in progress:
         model.train()
+
+        # Measured before the step, so the geometry reported is the one at the
+        # parameters this iteration is about to move away from.
+        if probe_batches is not None and (
+            iteration % args.align_every == 0 or iteration == 1
+        ):
+            _, probe_components = criterion(model, **probe_batches)
+            alignment = gradient_alignment(
+                probe_components, model.parameters(), weights, previous=probe_state
+            )
+            for name, value in alignment.items():
+                writer.add_scalar(f"{alignment_group(name)}/{name}", value, iteration)
+            cosines = " ".join(
+                f"{key.removeprefix('cos_')}={alignment[key]:+.3f}"
+                for key in ("cos_data_pde", "cos_data_bc", "cos_data_ic", "cos_data_physics")
+                if key in alignment
+            )
+            norms = " ".join(
+                f"{term}={alignment[f'gnorm_{term}']:.2e}"
+                for term in ("data", "pde", "bc", "ic")
+                if f"gnorm_{term}" in alignment
+            )
+            ratio = alignment.get("norm_ratio_physics_data")
+            progress.write(
+                f"[align {iteration:6d}] cos {cosines} | |g| {norms}"
+                + ("" if ratio is None else f" | w|g| phys/data={ratio:.3e}")
+            )
+            # Absent on the first measurement, which has nothing to difference
+            # against, and whenever the step moved nothing.
+            curvature = " ".join(
+                f"{term}={alignment[f'curv_{term}']:+.2e}"
+                for term in ("data", "pde", "bc", "ic")
+                if f"curv_{term}" in alignment
+            )
+            if curvature:
+                pair = alignment.get("cos_y_data_pde")
+                total = alignment.get("curv_total")
+                progress.write(
+                    f"[curv  {iteration:6d}] sTy {curvature}"
+                    + ("" if total is None else f" | total={total:+.2e}")
+                    + ("" if pair is None else f" | cos_y(data,pde)={pair:+.3f}")
+                    + f" | |s|={alignment.get('snorm', 0.0):.2e}"
+                )
 
         batches = fixed_batches or sampler.batches(
             args.batch_data, args.batch_physics, args.batch_boundary
