@@ -15,7 +15,7 @@ which keeps the residuals in ``loss.py`` dimensionally correct without any manua
 rescaling.
 
 The activation stays the ``SiLU`` of the baseline rather than moving to the
-``tanh`` of :mod:`models.pidon`. It is smooth, so the second derivative the PDE
+``tanh`` of :mod:`models.pidon_old`. It is smooth, so the second derivative the PDE
 residual needs is there, and keeping it means ``mlp`` and ``pimlp`` differ in
 their objective and in nothing else. A piecewise-linear activation such as
 ``ReLU`` would not do: it makes the Laplacian identically zero.

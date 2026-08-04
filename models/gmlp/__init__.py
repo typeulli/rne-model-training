@@ -1,6 +1,6 @@
 """GMLP -- the dense-stack baseline, gated by a Gaussian on the moving beam.
 
-:mod:`models.mlp` with the gate :mod:`models.gdon` applies to its operator: the
+:mod:`models.mlp` with the gate :mod:`models.gdon_old` applies to its operator: the
 output of the dense stack is multiplied by ``G = g + p`` -- a unit-peak Gaussian
 riding on the beam, lifted by a single learnable scalar -- before the bias is
 added. Same inputs, same objective, same training loop, so what it isolates is

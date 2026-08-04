@@ -1,6 +1,6 @@
 """Geometry of the moving laser beam, used to gate the network output.
 
-A copy of ``models/gdon/laser.py``: GMLP gates a dense stack rather than an
+A copy of ``models/gdon_old/laser.py``: GMLP gates a dense stack rather than an
 operator net, but what it needs from the beam is the same -- where it is. Kept as
 a copy rather than an import so an experiment on one model cannot shift the other
 underneath it.

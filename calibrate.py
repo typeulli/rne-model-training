@@ -2,8 +2,8 @@
 
 The models need material properties and laser parameters that the ``.npy`` files
 do not carry. Rather than guessing them, this script fits them to the data and
-prints blocks that can be pasted into ``models/gpidon/laser.py`` (the beam
-geometry) and ``models/gpidon/loss.py`` (the rest). Nothing here
+prints blocks that can be pasted into ``models/gpidon_old/laser.py`` (the beam
+geometry) and ``models/gpidon_old/loss.py`` (the rest). Nothing here
 depends on a trained network -- the constants are a property of the simulation,
 so one fit serves every model.
 
@@ -197,13 +197,13 @@ def main() -> None:
     print(f"[bc  ] peak flux at P_max = {fit.reference_peak_flux:.4e} W/m^2")
     print(f"[bc  ] residual RMS = {fit.residual_rms:.4e} W/m^2 ({fit.relative_residual:.2%} of peak)")
 
-    print("\n--- paste into models/gpidon/laser.py ---")
+    print("\n--- paste into models/gpidon_old/laser.py ---")
     print(f"BEAM_RADIUS = {fit.beam_radius / MM:.4f} * MM")
     print(f"LASER_START_X = {fit.start_x / MM:.4f} * MM")
     print(f"LASER_Y = {fit.track_y / MM:.4f} * MM")
     print(f"SCAN_SPEED = {fit.scan_speed / MM:.4f} * MM")
 
-    print("\n--- paste into models/gpidon/loss.py ---")
+    print("\n--- paste into models/gpidon_old/loss.py ---")
     print(f"ABSORPTIVITY = {fit.absorptivity:.4f}")
     print("PROPERTIES = ThermalProperties(")
     print(f"    density={DENSITY},")

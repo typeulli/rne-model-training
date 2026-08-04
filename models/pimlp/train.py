@@ -4,7 +4,7 @@ Invoked through the top-level dispatcher::
 
     python train.py pimlp --iterations 20000
 
-Identical to ``models/pidon/train.py`` -- same objective, same collocation
+Identical to ``models/pidon_old/train.py`` -- same objective, same collocation
 batches, same ``--w-*`` weights -- except that the network is the dense stack of
 ``models/mlp`` rather than a DeepONet. The iteration-based loop comes with the
 PINN objective: the physics batches are resampled every step, so there is no

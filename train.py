@@ -9,8 +9,8 @@ ever sees the command line.
 Examples::
 
     python train.py --list
-    python train.py gpidon --iterations 20000 --lr 1e-3
-    python train.py gpidon --help
+    python train.py gpidon_old --iterations 20000 --lr 1e-3
+    python train.py gpidon_old --help
 """
 
 from __future__ import annotations

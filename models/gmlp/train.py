@@ -48,7 +48,7 @@ from .model import GatedMLP
 
 MODEL_NAME = "gmlp"
 
-# Matches models/gpidon/loss.py; only used to centre the output, so an exact
+# Matches models/gpidon_old/loss.py; only used to centre the output, so an exact
 # value is not critical.
 AMBIENT_TEMPERATURE = 298.0
 

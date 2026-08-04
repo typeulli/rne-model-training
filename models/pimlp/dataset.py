@@ -1,6 +1,6 @@
 """Turn the shared point cloud into the six batches PiMLP's PINN loss consumes.
 
-A copy of :mod:`models.pidon.dataset`, and for the same reason: the base
+A copy of :mod:`models.pidon_old.dataset`, and for the same reason: the base
 :class:`~dataset.SimulationDataset` only knows about labelled samples, while the
 PDE, boundary and initial-condition terms need points that no simulation row
 supplies -- interior collocation points, points pinned to a face with the outward
@@ -10,7 +10,7 @@ the labels span.
 Only the data batch carries temperatures; the rest are unlabelled and get their
 targets from the physics.
 
-:func:`normalisation` is the one thing here that has no counterpart in PiDoN. The
+:func:`normalisation` is the one thing here that has no counterpart in PiDoNOld. The
 network is a dense stack over ``(P, t, z, y, x)``, not an operator net with
 separate branch and trunk inputs, so it takes a single ``[5]`` mean and scale --
 the same one :meth:`models.mlp.dataset.MLPDataset.normalisation` derives.

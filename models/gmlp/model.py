@@ -1,6 +1,6 @@
 """The MLP baseline with a Gaussian riding on the moving beam multiplied into it.
 
-:mod:`models.gdon` gates the inner product of a DeepONet; this gates the output
+:mod:`models.gdon_old` gates the inner product of a DeepONet; this gates the output
 of the plain dense stack of :mod:`models.mlp`, and changes nothing else:
 
     ``T_hat = T_amb + dT * (net(P, t, z, y, x) * G(x, y, z, t) + b)``
@@ -23,7 +23,7 @@ pure gate, and as ``p`` grows the gate flattens and the model approaches
 
 The head ``Linear`` carries no bias of its own -- it would be gated along with
 everything else -- and ``b`` is a separate parameter added *after* the gate, which
-is exactly where :class:`~models.gdon.model.GDoN` adds its operator bias.
+is exactly where :class:`~models.gdon_old.model.GDoNOld` adds its operator bias.
 
 Everything else is :class:`~models.mlp.model.SimpleMLP`: the same
 ``(P, t, z, y, x)`` input order, the same normalisation buffers, the same

@@ -1,6 +1,6 @@
 """A plain feed-forward regression of the temperature field.
 
-Where GPiDoN factorises the map into a branch over the process parameter and a
+Where GPiDoNOld factorises the map into a branch over the process parameter and a
 trunk over space-time, this takes the five numbers together and pushes them
 through one stack of dense layers:
 

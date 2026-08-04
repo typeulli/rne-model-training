@@ -6,7 +6,7 @@ Invoked through the top-level dispatcher::
 
 The whole corpus is loaded into memory up front, split once into train and
 validation, and every step draws a random batch (with replacement) from the
-train split -- matching how ``models/gpidon`` consumes the same dataset. An
+train split -- matching how ``models/gpidon_old`` consumes the same dataset. An
 "epoch" is not a shuffled pass over every row; it is ``--steps-per-epoch``
 such batches, after which the model is scored against the full validation
 split and the best checkpoint is updated.
@@ -44,7 +44,7 @@ from .model import SimpleMLP
 
 MODEL_NAME = "mlp"
 
-# Matches models/gpidon/loss.py; only used to centre the output, so an exact
+# Matches models/gpidon_old/loss.py; only used to centre the output, so an exact
 # value is not critical.
 AMBIENT_TEMPERATURE = 298.0
 

@@ -53,9 +53,9 @@ returns bit-identical output, by construction.
 | `cmlp` | dense | — | data MSE | ✗ | what `P` is worth |
 | `cgmlp` | dense | `g + p` | data MSE | ✗ | the beam prior, without `P` |
 | `cpimlp` | dense | — | PINN | ✗ | the physics, without `P` |
-| `pidon` | DeepONet | — | PINN | ✓ | the operator architecture |
-| `gdon` | DeepONet | `g + p` | data MSE | ✓ | the operator without the physics |
-| `gpidon` | DeepONet | `g + p` | PINN | ✓ | all three together |
+| `pidon_old` | DeepONet | — | PINN | ✓ | the operator architecture |
+| `gdon_old` | DeepONet | `g + p` | data MSE | ✓ | the operator without the physics |
+| `gpidon_old` | DeepONet | `g + p` | PINN | ✓ | all three together |
 
 ---
 
@@ -189,7 +189,7 @@ nothing else.
 
 ---
 
-## Operator nets — `pidon`, `gdon`, `gpidon`
+## Operator nets — `pidon_old`, `gdon_old`, `gpidon_old`
 
 A DeepONet instead of a dense stack. A **branch** network encodes the process
 parameter, a **trunk** network encodes the space-time query point, and their
@@ -209,7 +209,7 @@ beam lifted by a single learnable scalar — and it is there for the same reason
 without `p`, the prediction would be pinned to ambient everywhere `g` has died
 off, making the diffused field unrepresentable. The operator bias `b` is added
 *after* the gate, so it escapes being gated, exactly as in `gmlp`. `p` is constant
-in space and time, so in `gpidon` it shifts the gate without contributing a
+in space and time, so in `gpidon_old` it shifts the gate without contributing a
 derivative of its own, leaving the PDE residual undisturbed.
 
 - **Network input** — `(laser_power, coords)`: `[B, 1]` branch input and `[B, 4]`
@@ -219,13 +219,13 @@ derivative of its own, leaving the PDE residual undisturbed.
 
 | model | gate `G` | objective |
 |---|---|---|
-| `pidon` | none (output unconstrained) | PINN |
-| `gdon` | `g + p` on the inner product | data MSE only |
-| `gpidon` | `g + p` on the inner product | PINN |
+| `pidon_old` | none (output unconstrained) | PINN |
+| `gdon_old` | `g + p` on the inner product | data MSE only |
+| `gpidon_old` | `g + p` on the inner product | PINN |
 
-`pidon` is kept so checkpoints trained before the gate was added still load;
+`pidon_old` is kept so checkpoints trained before the gate was added still load;
 in it, the only Gaussian in the problem is the laser source term of the top
-boundary condition. `gdon` is `gpidon` minus the physics residuals, and isolates
+boundary condition. `gdon_old` is `gpidon_old` minus the physics residuals, and isolates
 what those residuals contribute.
 
 ---
@@ -240,7 +240,7 @@ python train.py --list                                  # the nine names above
 python train.py mlp    --epochs 20 --batch-size 8192
 python train.py cgmlp  --hidden 64 64 64 --tag 64x3
 python train.py cpimlp --iterations 20000 --physics-power 175
-python train.py gpidon --help
+python train.py gpidon_old --help
 
 # a directory holding only one power's .npy trains/validates on that power alone
 python train.py cgmlp --data-dir /path/to/only-175W --tag 175W
@@ -305,15 +305,15 @@ dense models help on the `P`-aware side.
 
 | model | val RMSE | learned `p` |
 |---|---|---|
-| `gdon` (data MSE) | **2.950 K** | +0.449 |
-| `gpidon` (PINN) | **11.678 K** | +1.269 |
+| `gdon_old` (data MSE) | **2.950 K** | +0.449 |
+| `gpidon_old` (PINN) | **11.678 K** | +1.269 |
 
-The gate offset earns its keep here. `gdon` with a bare `g` gate scored 27.298 K:
+The gate offset earns its keep here. `gdon_old` with a bare `g` gate scored 27.298 K:
 it fit the beam peak well but predicted ambient everywhere the Gaussian had died
 off, so the long thermal trail behind the beam was simply absent — errors of
 −348 K across most of the plate. Adding the learnable floor `p` cut that to
-2.950 K. The PINN variant tells the opposite story: `gpidon` drives `p` up to
-+1.269, flattening the gate far more than `gdon` does, recovers the trail — and
+2.950 K. The PINN variant tells the opposite story: `gpidon_old` drives `p` up to
++1.269, flattening the gate far more than `gdon_old` does, recovers the trail — and
 then blunts the peak, undershooting it by ~600 K. Its residuals evidently prefer a
 smooth field to a sharp one.
 

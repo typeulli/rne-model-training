@@ -50,7 +50,7 @@ from .model import ControlGatedMLP
 
 MODEL_NAME = "cgmlp"
 
-# Matches models/gpidon/loss.py; only used to centre the output, so an exact
+# Matches models/gpidon_old/loss.py; only used to centre the output, so an exact
 # value is not critical.
 AMBIENT_TEMPERATURE = 298.0
 

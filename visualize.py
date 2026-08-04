@@ -16,8 +16,8 @@ The model is reached only through its agent's ``predict_at``, so any model under
 
 Examples::
 
-    python visualize.py --model gpidon --checkpoint checkpoints/gpidon/best.pt --power 200
-    python visualize.py --model gpidon --checkpoint best.pt --power 250 --plane track
+    python visualize.py --model gpidon_old --checkpoint checkpoints/gpidon_old/best.pt --power 200
+    python visualize.py --model gpidon_old --checkpoint best.pt --power 250 --plane track
 """
 
 from __future__ import annotations
@@ -197,7 +197,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--model", default="gpidon", choices=available_models(), help="which model to load"
+        "--model", default="gpidon_old", choices=available_models(), help="which model to load"
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)

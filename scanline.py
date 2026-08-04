@@ -22,8 +22,8 @@ any one model's ``loss.py``.
 
 Examples::
 
-    python scanline.py --model gpidon --checkpoint best.pt --power 200
-    python scanline.py --model gpidon --checkpoint best.pt --power 250 --gaussian --z 5.5
+    python scanline.py --model gpidon_old --checkpoint best.pt --power 200
+    python scanline.py --model gpidon_old --checkpoint best.pt --power 250 --gaussian --z 5.5
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ INK_SECONDARY = "#52514e"
 # a low alpha rather than a categorical slot of its own.
 PATCH_COLOUR = "#6b6a66"
 
-# Defaults matching the calibrated constants in models/gpidon/loss.py.
+# Defaults matching the calibrated constants in models/gpidon_old/loss.py.
 AMBIENT_TEMPERATURE = 298.0  # [K]
 BEAM_RADIUS = 1.6971  # [mm], 1/e^2
 
@@ -440,7 +440,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--model", default="gpidon", choices=available_models(), help="which model to load"
+        "--model", default="gpidon_old", choices=available_models(), help="which model to load"
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)

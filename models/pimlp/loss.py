@@ -1,8 +1,8 @@
 """The PINN objective for PiMLP, and the physical constants it is built from.
 
-A copy of ``models/pidon/loss.py``: the residuals do not care what shape the
+A copy of ``models/pidon_old/loss.py``: the residuals do not care what shape the
 network inside them has, so the objective PiMLP is fitted against is exactly the
-one PiDoN is fitted against -- which is what lets the pair isolate the
+one PiDoNOld is fitted against -- which is what lets the pair isolate the
 architecture, and ``mlp`` vs ``pimlp`` isolate the physics. Kept as a copy rather
 than an import so an experiment on one model cannot shift the other underneath
 it.
