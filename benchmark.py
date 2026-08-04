@@ -32,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-from agent import BaseAgent
+from agent import BaseAgent, peak_corrected
 from dataset import DEFAULT_FIELD_SHAPE
 from models import available_models, build_agent
 from utils import count_parameters, load_checkpoint, resolve_device
@@ -110,6 +110,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="query points per forward pass; defaults to the agent's own",
     )
+    parser.add_argument(
+        "--pkcorrect",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CHECKPOINT",
+        help="time the field with a cpkmlp patch pasted over its peak; takes a "
+        "cpkmlp checkpoint, or nothing for the most recent under checkpoints/cpkmlp/",
+    )
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -126,6 +135,10 @@ def main() -> None:
 
     checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
     print(f"[load] {args.checkpoint.name}: val RMSE {checkpoint['val_rmse']:.3f} K")
+
+    if args.pkcorrect is not None:
+        agent = peak_corrected(agent, args.pkcorrect or None, device=device)
+
     print(
         f"[setup] device={device} dtype={agent.dtype} "
         f"params={count_parameters(agent.model)} chunk={agent.chunk}"
@@ -136,7 +149,7 @@ def main() -> None:
     print(f"[setup] {args.warmup} warmup + {args.repeats} timed calls\n")
 
     samples = time_field(agent, args.time, args.power, args.repeats, args.warmup)
-    report(args.model, samples, nodes)
+    report(args.model + ("+pk" if args.pkcorrect is not None else ""), samples, nodes)
 
 
 if __name__ == "__main__":

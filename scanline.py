@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.figure import Figure
 
-from agent import BaseAgent
+from agent import BaseAgent, PeakCorrectedAgent, peak_corrected
 from dataset import MM, DEFAULT_DATA_DIR, Grid, find_grid
 from models import available_models, build_agent
 from utils import checkpoint_stamp, load_checkpoint, resolve_device, resolve_figure_path
@@ -47,6 +47,9 @@ from visualize import predict
 TRUTH_COLOUR = "#2a78d6"
 PREDICTION_COLOUR = "#eb6834"
 INK_SECONDARY = "#52514e"
+# The cpkmlp window is an annotation, not a series, so it takes a neutral ink and
+# a low alpha rather than a categorical slot of its own.
+PATCH_COLOUR = "#6b6a66"
 
 # Defaults matching the calibrated constants in models/gpidon/loss.py.
 AMBIENT_TEMPERATURE = 298.0  # [K]
@@ -111,6 +114,25 @@ def fit_gaussian(
     return GaussianFit(float(amplitude), float(centre), abs(float(width)), r_squared, ambient)
 
 
+def mark_patch(axis, span: tuple[float, float], unit: float, label: str | None):
+    """Shade ``span`` -- the stretch of the axis a ``cpkmlp`` patch was pasted over.
+
+    Kept deliberately faint. The panels it goes behind carry two curves and a
+    filled error, and the point of the band is to say *where* the two models
+    change hands, not to compete with what they say there. Returns the shading,
+    so a caller assembling its own legend can put it in.
+    """
+    low, high = span[0] / unit, span[1] / unit
+    shading = axis.axvspan(
+        low, high, color=PATCH_COLOUR, alpha=0.10, linewidth=0, label=label
+    )
+    for edge in (low, high):
+        axis.axvline(
+            edge, color=PATCH_COLOUR, linewidth=0.9, linestyle=(0, (4, 2)), alpha=0.7
+        )
+    return shading
+
+
 def layer_index(grid: Grid, depth: float | None) -> int:
     """The ``z`` index the profiles are cut at; the top surface when ``depth`` is None."""
     return len(grid.z) - 1 if depth is None else int(np.argmin(np.abs(grid.z - depth)))
@@ -156,6 +178,25 @@ def surface_error_history(
         np.array(peak_truth),
         np.array(peak_prediction),
     )
+
+
+def limits_excluding_initial(
+    times: np.ndarray, series: tuple[np.ndarray, ...], margin: float = 0.05
+) -> tuple[float, float] | None:
+    """``(low, high)`` covering ``series`` over ``t > 0``, or None if nothing is left.
+
+    At ``t = 0`` the plane is uniformly at ambient and the model has had nothing
+    to fit yet, so that one step can miss by more than the whole run after it.
+    Letting it set the scale flattens the rest of the history into a line. The
+    curves are still drawn from ``t = 0``; only the range ignores it.
+    """
+    keep = times > 0.0
+    if not keep.any():
+        return None
+    values = np.concatenate([np.asarray(one)[keep] for one in series])
+    low, high = float(values.min()), float(values.max())
+    pad = margin * (high - low) if high > low else margin * max(abs(high), 1.0)
+    return low - pad, high + pad
 
 
 def line_coords(
@@ -227,6 +268,23 @@ def draw(
         )
 
         profile_axis, error_axis = axes[row]
+
+        # The window travels with the beam, so it is marked per row -- and only
+        # when it reaches the line this row cuts, which is a question about y and
+        # z that the cut answers and the profile cannot.
+        box = (
+            agent.patch_box(actual["t"])
+            if isinstance(agent, PeakCorrectedAgent)
+            else None
+        )
+        if (
+            box is not None
+            and box[1][0] <= actual["y"] <= box[1][1]
+            and box[2][0] <= actual["z"] <= box[2][1]
+        ):
+            mark_patch(profile_axis, box[0], MM, "cpkmlp" if row == 0 else None)
+            mark_patch(error_axis, box[0], MM, None)
+
         profile_axis.plot(
             x / MM, truth, color=TRUTH_COLOUR, linewidth=1.8, label="simulation"
         )
@@ -327,6 +385,15 @@ def draw(
             linestyle="--", label=f"peak T, {model_name}",
         )[0],
     ]
+    # Both scales are read off the history after t = 0; see the helper for why.
+    error_limits = limits_excluding_initial(history_t, (history_worst, history_rmse))
+    if error_limits is not None:
+        history_axis.set_ylim(*error_limits)
+    temperature_limits = limits_excluding_initial(
+        history_t, (peak_truth, peak_prediction)
+    )
+    if temperature_limits is not None:
+        temperature_axis.set_ylim(*temperature_limits)
     # Tie the curves back to the rows above: these are the instants they cut.
     for time in times:
         nearest = float(history_t[int(np.argmin(np.abs(history_t - time)))])
@@ -339,15 +406,22 @@ def draw(
         f"stored time (worst error {history_worst.max():.0f} K)",
         fontsize=10,
     )
+    # Over time the window is a span rather than a box: the patch answers at every
+    # instant of its own clock, and leaves the model alone outside it.
+    patch_lines = []
+    if isinstance(agent, PeakCorrectedAgent):
+        clock = (float(agent.window[3, 0]), float(agent.window[3, 1]))
+        patch_lines.append(mark_patch(history_axis, clock, 1.0, "cpkmlp applied"))
+
     # Below the axes rather than inside it: four curves on two scales leave no
     # corner reliably free, and which corner is free changes with the model.
-    lines = error_lines + temperature_lines
+    lines = error_lines + temperature_lines + patch_lines
     history_axis.legend(
         lines,
         [line.get_label() for line in lines],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.28),
-        ncol=4,
+        ncol=len(lines),
         frameon=False,
         fontsize=8,
     )
@@ -397,6 +471,15 @@ def parse_args() -> argparse.Namespace:
         help="half-width in mm of the fit window around the peak",
     )
     parser.add_argument(
+        "--pkcorrect",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CHECKPOINT",
+        help="paste a cpkmlp patch over the peak of the predicted field; takes a "
+        "cpkmlp checkpoint, or nothing for the most recent under checkpoints/cpkmlp/",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -419,6 +502,9 @@ def main() -> None:
     )
     print(f"[load] {grid.name}: {grid.temperature.shape} at P = {grid.power} W")
 
+    if args.pkcorrect is not None:
+        agent = peak_corrected(agent, args.pkcorrect or None, device=device)
+
     figure = draw(
         grid,
         agent,
@@ -436,6 +522,7 @@ def main() -> None:
         args.model,
         f"P{args.power:g}",
         "line",
+        *(("pkcorrect",) if args.pkcorrect is not None else ()),
         stamp=checkpoint_stamp(args.checkpoint),
     )
     figure.savefig(out, dpi=140)

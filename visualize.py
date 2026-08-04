@@ -28,8 +28,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 
-from agent import BaseAgent
+from agent import BaseAgent, PeakCorrectedAgent, peak_corrected
 from dataset import MM, DEFAULT_DATA_DIR, Grid, find_grid
 from models import available_models, build_agent
 from utils import checkpoint_stamp, load_checkpoint, resolve_device, resolve_figure_path
@@ -81,6 +82,33 @@ def slice_coords(
     return coords.reshape(-1, 4), truth, extent, labels
 
 
+def mark_patch(axis, box: tuple[tuple[float, float], ...], plane: str, colour: str) -> None:
+    """Outline the region a :class:`~agent.PeakCorrectedAgent` overwrote.
+
+    ``colour`` is the caller's, because the panels do not share a colour map and
+    no single ink is readable on both. The window's edges sit 2.4 mm from the
+    beam, where ``inferno`` is nearly black, so the field panels take white; the
+    error panel is pale wherever the model is right, so it takes near-black. A
+    halo would serve both at once but reads as a double line against a flat
+    background, and the box is meant to be read as one edge.
+    """
+    horizontal, depth_pair, height_pair = box  # (x, y, z), matching the panels' axes
+    first = horizontal
+    second = depth_pair if plane == "top" else height_pair
+
+    axis.add_patch(
+        Rectangle(
+            (first[0] / MM, second[0] / MM),
+            (first[1] - first[0]) / MM,
+            (second[1] - second[0]) / MM,
+            fill=False,
+            edgecolor=colour,
+            linestyle=(0, (4, 2)),
+            linewidth=1.1,
+        )
+    )
+
+
 def draw(
     grid: Grid,
     agent: BaseAgent,
@@ -105,7 +133,12 @@ def draw(
         squeeze=False,
         constrained_layout=True,
     )
-    figure.suptitle(f"P = {grid.power:.0f} W, plane = {plane}", fontsize=13)
+    corrected = isinstance(agent, PeakCorrectedAgent)
+    figure.suptitle(
+        f"P = {grid.power:.0f} W, plane = {plane}"
+        + ("   (dashed box: replaced by cpkmlp)" if corrected else ""),
+        fontsize=13,
+    )
 
     for row, time in enumerate(times):
         coords, truth, extent, labels = slice_coords(grid, plane, time, track_y)
@@ -136,6 +169,17 @@ def draw(
         axes[row][2].set_title(
             f"prediction - simulation\nmax |error| {worst:.0f} K", fontsize=10
         )
+
+        # The patch is pasted in a window that moves with the beam, so it is
+        # outlined per row rather than once for the figure.
+        box = (
+            agent.patch_box(float(coords[0, 3]))
+            if isinstance(agent, PeakCorrectedAgent)
+            else None
+        )
+        if box is not None:
+            for column, colour in enumerate(("white", "white", "#111111")):
+                mark_patch(axes[row][column], box, plane, colour)
 
         for column in range(3):
             axes[row][column].set_xlabel(labels[0])
@@ -169,6 +213,15 @@ def parse_args() -> argparse.Namespace:
         help="scan-line y in mm, for --plane track",
     )
     parser.add_argument(
+        "--pkcorrect",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CHECKPOINT",
+        help="paste a cpkmlp patch over the peak of the predicted field; takes a "
+        "cpkmlp checkpoint, or nothing for the most recent under checkpoints/cpkmlp/",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -191,6 +244,9 @@ def main() -> None:
     )
     print(f"[load] {grid.name}: {grid.temperature.shape} at P = {grid.power} W")
 
+    if args.pkcorrect is not None:
+        agent = peak_corrected(agent, args.pkcorrect or None, device=device)
+
     figure = draw(grid, agent, args.model, args.times, args.plane, args.track_y * MM)
 
     out = resolve_figure_path(
@@ -198,6 +254,7 @@ def main() -> None:
         args.model,
         f"P{args.power:g}",
         args.plane,
+        *(("pkcorrect",) if args.pkcorrect is not None else ()),
         stamp=checkpoint_stamp(args.checkpoint),
     )
     figure.savefig(out, dpi=140)
