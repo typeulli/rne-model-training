@@ -67,4 +67,9 @@ def build_agent(
 
     model = ControlSourceMLP(**payload["architecture"])
     model.load_state_dict(payload["model"])  # normalisation and gate buffers ride along
-    return CJMLPAgent(model, payload["bounds"], shape=shape, device=device)
+    agent = CJMLPAgent(model, payload["bounds"], shape=shape, device=device)
+    # The window this base ceded to a patch, if any. `agent.peak_corrected`
+    # refuses a patch that does not cover exactly it; absent means the base
+    # was fitted to the whole plate and any patch is safe.
+    agent.cede_window = payload.get("cede_window")
+    return agent

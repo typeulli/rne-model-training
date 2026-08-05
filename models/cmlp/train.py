@@ -49,6 +49,8 @@ from utils import (
     seed_everything,
 )
 
+from models._ceded import add_cede_argument, cede_patch_window
+
 from .dataset import CMLPDataset
 from .loss import ScaledMSELoss
 from .model import ControlMLP
@@ -93,6 +95,7 @@ def evaluate(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog=f"train.py {MODEL_NAME}", description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    add_cede_argument(parser)
     parser.add_argument(
         "--exclude",
         type=int,
@@ -157,6 +160,9 @@ def main(argv: list[str] | None = None) -> None:
         clip_below=AMBIENT_TEMPERATURE if CLIP_SUBAMBIENT else None,
         exclude_steps=args.exclude,
     )
+    # Before the split, so the validation half has the window removed too: scoring
+    # a base on ground cpkmlp will overwrite would choose checkpoints on noise.
+    corpus, cede_window, cede_anchor = cede_patch_window(corpus, args.cede_from)
     domain = corpus.domain
     temperature_rise = corpus.temperature_rise(AMBIENT_TEMPERATURE)
 
@@ -270,6 +276,8 @@ def main(argv: list[str] | None = None) -> None:
                 "model": model.state_dict(),
                 "architecture": architecture,
                 "bounds": domain.bounds.detach().cpu(),
+                **({"cede_window": cede_window, "cede_anchor": cede_anchor}
+                   if cede_window is not None else {}),
                 "val_rmse": rmse,
                 "epoch": epoch,
             },

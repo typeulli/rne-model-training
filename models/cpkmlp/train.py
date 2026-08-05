@@ -2,7 +2,7 @@
 
 Invoked through the top-level dispatcher::
 
-    python train.py cpkmlp --data-dir ../rne-am-simulation/data/train_175W \
+    python train.py cpkmlp --data-dir ../data/train_175W \
         --hidden 64 64 64 --exclude 1 --tag 175W
 
 ``models/cmlp/train.py`` with one thing changed: the corpus is

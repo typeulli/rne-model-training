@@ -1,4 +1,4 @@
-"""Shared access to the simulation output produced by ``rne-am-simulation``.
+"""Shared access to the simulation output produced by ``rne-kaist``.
 
 Every model in ``models/`` reads the same ``.npy`` corpus through this module, so
 the on-disk layout, the unit conversion and the train/validation split are
@@ -6,14 +6,17 @@ defined exactly once.
 
 The corpus is split on disk by laser power, not by row:
 
-``rne-am-simulation/data/train``
+``data/train``
     the powers a model may fit -- 100, 125, 150, 175, 200, 225, 250 W.
-``rne-am-simulation/data/valid``
+``data/valid``
     powers held out entirely, to measure generalisation *across ``P``* rather
     than across points of a power the model has already seen.
 
 :data:`DEFAULT_DATA_DIR` points at ``train`` alone, so the held-out powers
-cannot be swept up by the recursive glob and silently trained on.
+cannot be swept up by the recursive glob and silently trained on. The same
+applies to ``data/toolpath``, which holds the 20 x 20 x 6 mm scan-pattern runs:
+it is a sibling of ``train`` rather than a child, because those runs are on a
+different domain and grid and every model here assumes the straight pass.
 
 Each file is a structured grid of ``(x, y, z, t, P, T)`` rows -- ``161 x 41 x
 25 x 8 = 1320200`` for the shipped sweep. ``P`` is constant within a file, so a
@@ -48,7 +51,7 @@ from torch.utils.data import Dataset
 MM = 1.0e-3
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_ROOT = PROJECT_ROOT.parent / "rne-am-simulation" / "data"
+DATA_ROOT = PROJECT_ROOT.parent / "data"
 
 # Training globs DEFAULT_DATA_DIR recursively, so the held-out powers live in a
 # sibling of it rather than beneath it.

@@ -1,7 +1,7 @@
 # rne-model-training
 
 Neural surrogates for the transient temperature field produced by
-`rne-am-simulation`: a Gaussian laser sweeping the top face of a 40 x 10 x 6 mm
+`rne-kaist`: a Gaussian laser sweeping the top face of a 40 x 10 x 6 mm
 plate. Every model learns the same map
 
 ```
@@ -9,7 +9,7 @@ T(x, y, z, t ; P)        x,y,z [m]   t [s]   P [W]   T [K]
 ```
 
 from the same corpus — seven laser powers (100 … 250 W in 25 W steps, 1 320 200
-points each) under `rne-am-simulation/data/train`, with 160 W held out entirely
+points each) under `../data/train`, with 160 W held out entirely
 under `data/valid` to measure generalisation *across* `P` rather than across
 points of a power already seen.
 

@@ -201,6 +201,22 @@ class PeakCorrectedAgent(BaseAgent):
                 f"{type(patch).__name__} has no `centre(time)`; the patch must say "
                 "what frame its offsets are measured in"
             )
+        # A base trained with `--cede-from` has a hole in it the exact shape of the
+        # window it was told a patch would fill. Pasting a patch that covers a
+        # different box leaves either a ring neither model ever learned or ground
+        # the base did learn being overwritten -- and neither shows up as anything
+        # but a worse number. The two boxes are compared rather than trusted.
+        ceded = getattr(base, "cede_window", None)
+        if ceded is not None:
+            from models._ceded import windows_agree
+
+            if not windows_agree(ceded, patch.bounds):
+                raise ValueError(
+                    f"{type(base).__name__} ceded {torch.as_tensor(ceded).tolist()} "
+                    f"but {type(patch).__name__} covers {patch.bounds.tolist()}; "
+                    "they must be the same window"
+                )
+
         self.base = base
         self.patch = patch
         self.window = patch.bounds.to(self.device)

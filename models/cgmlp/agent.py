@@ -62,4 +62,9 @@ def build_agent(
 
     model = ControlGatedMLP(**payload["architecture"])
     model.load_state_dict(payload["model"])  # normalisation buffers ride along
-    return CGMLPAgent(model, payload["bounds"], shape=shape, device=device)
+    agent = CGMLPAgent(model, payload["bounds"], shape=shape, device=device)
+    # The window this base ceded to a patch, if any. `agent.peak_corrected`
+    # refuses a patch that does not cover exactly it; absent means the base
+    # was fitted to the whole plate and any patch is safe.
+    agent.cede_window = payload.get("cede_window")
+    return agent
