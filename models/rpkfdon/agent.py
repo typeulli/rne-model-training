@@ -50,6 +50,10 @@ def peak_corrected(
         )
     patch = build_agent(path, toolpath=base.path, shape=base.shape,
                         device=device or base.device)
-    print(f"[load] {MODEL_NAME}: {path.name}, pasted over a "
-          f"{2e3 * patch.radius:g} x {2e3 * patch.radius:g} mm square held with the pool")
+    shape = (
+        f"{2e3 * patch.radius:g} mm disc"
+        if patch.window == "circle"
+        else f"{2e3 * patch.radius:g} x {2e3 * patch.radius:g} mm square"
+    )
+    print(f"[load] {MODEL_NAME}: {path.name}, pasted over a {shape} held with the pool")
     return GenericPeakCorrectedAgent(base, patch)

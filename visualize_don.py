@@ -188,10 +188,17 @@ def draw(
     # pointwise one by `pkdon`, and a caption that says the wrong one is worse
     # than no caption.
     pasted_by = ", ".join(sorted(patch_models or {"the patch"}))
+    # The outline is whatever shape the patch owns, so the caption reads it off
+    # the agents rather than naming a square the window may no longer be.
+    outline = "square"
+    for agent in agents.values():
+        window = getattr(getattr(agent, "patch", None), "window", None)
+        if window is not None:
+            outline = "circle" if window == "circle" else "square"
     figure.suptitle(
         f"{pattern}   P = {grid.power:.0f} W   plane = {plane}   "
         f"({path.duration:.2f} s scan, {100 * path.lit_time / path.duration:.0f}% lit)"
-        + (f"   (dashed square: replaced by {pasted_by})" if corrected else ""),
+        + (f"   (dashed {outline}: replaced by {pasted_by})" if corrected else ""),
         fontsize=13, color=INK,
     )
     if provenance:

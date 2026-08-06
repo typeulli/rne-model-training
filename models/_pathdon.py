@@ -102,7 +102,7 @@ DEFAULT_LR = 3e-4
 
 
 def beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
-    """``[len(times), 5]`` of ``(x_l, y_l, lit, v_x, v_y)`` in SI at each time.
+    """``[len(times), 6]`` of ``(x_l, y_l, lit, v_x, v_y, q)`` in SI at each time.
 
     :meth:`Toolpath.position` gives the first three. The velocity is the fourth
     and fifth, and it is here because ``jdon`` needs it: Rosenthal's field is
@@ -110,6 +110,13 @@ def beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
     the direction of travel and a path that turns a corner turns its wake with it.
     A gate that assumed ``+x``, as every ``laser.py`` in this repository does,
     would put the trail in the wrong place for three of the four patterns.
+
+    ``q`` is the amplitude the gates carry, and here it is ``lit`` exactly. It is
+    a column of its own rather than a second reading of ``lit`` because
+    :func:`retouched_beam_state` needs the two to part company: over dark travel
+    the pool is still *there* -- which is what ``lit`` says, once held -- while the
+    heat that made it is *fading*, which is what ``q`` says. Keeping them separate
+    also keeps :func:`branch_vector`, which reads columns 0 to 2, out of it.
 
     Taken from the segment the time lands in rather than differenced from the
     positions, so it is exact and it does not smear across a corner.
@@ -132,12 +139,27 @@ def beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
             lit.astype(float),
             step[:, 0] / length * speed * MM,
             step[:, 1] / length * speed * MM,
+            lit.astype(float),
         ],
         axis=1,
     )
 
 
-def retouched_beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
+def dark_decay_time(physics: dict) -> float:
+    """``a^2 / (4 alpha)`` -- how long the pool takes to forget it was a pool.
+
+    The time constant the dark-travel amplitude fades on, taken from the physics
+    rather than tuned: an instantaneous point source in three dimensions leaves
+    ``T ~ (4 pi alpha t)^-3/2 exp(-r^2 / 4 alpha t)``, whose spatial part has
+    spread to the beam's own radius ``a`` at exactly this time. With ``a = 1.5 mm``
+    and ``alpha = 2.88e-6 m^2/s`` it is 0.196 s, which is half a stored snapshot.
+    """
+    return float(physics["beam_radius"]) ** 2 / (4.0 * float(physics["diffusivity"]))
+
+
+def retouched_beam_state(
+    path: Toolpath, times: np.ndarray, dark_tau: float = 0.0
+) -> np.ndarray:
     """:func:`beam_state`, but the beam does not move while the laser is off.
 
     Over a dark segment the head is travelling to the next track at 30 mm/s and
@@ -157,6 +179,22 @@ def retouched_beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
     trying to describe. Nothing is frozen *before* the first lit instant or after
     the scan ends: there is no pool yet in the first case, and the run is over in
     the second.
+
+    **What ``dark_tau`` adds.** Holding ``lit`` at 1 says the pool is there, and it
+    is; it also says the pool is as hot as it was under the beam, and it is not.
+    With ``dark_tau > 0`` the *amplitude* column ``q`` decays as
+    ``(tau / (dt + tau))^(3/2)`` from the instant the laser cut out -- the time part
+    of the three-dimensional heat kernel, shifted so it is 1 rather than infinite
+    at ``dt = 0``. The gates carry ``q``; the frame carries ``lit``. So the window
+    still sits on the pool while the shape pasted there fades, which is what a
+    source switching off actually looks like.
+
+    The speed is *not* ramped with it. The frame's heading is read off the same
+    two columns (``_sample`` and ``patch_box`` fall back to ``+x`` at zero speed,
+    which would spin the window), and Rosenthal's series stops being suppressed by
+    ``exp(-v (r + xi) / 2 alpha)`` as ``v`` falls, so its normalised peak *grows*
+    from 1.00 to 3.15 on the way to rest. Decaying the amplitude and inflating the
+    shape it multiplies are two knobs fighting over one number. Only ``q`` moves.
 
     This is the only difference between the ``r*`` family and the rest.
     """
@@ -207,12 +245,104 @@ def retouched_beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
     out[hold, 2] = 1.0  # the pool is there whether or not the laser is
     out[hold, 3] = step[:, 0] / length * speed * MM
     out[hold, 4] = step[:, 1] / length * speed * MM
+
+    # `t_nodes[i + 1]` is when that lit segment ended, which is when the source
+    # switched off -- the same node the position above was held at, so the clock
+    # and the place agree by construction.
+    if dark_tau > 0.0:
+        elapsed = t[hold] - path.t_nodes[i + 1]
+        out[hold, 5] = (dark_tau / (elapsed + dark_tau)) ** 1.5
+    else:
+        out[hold, 5] = 1.0
     return out
 
 
-def beam_of(retouched: bool):
-    """The beam-state function a model wants: held over dark travel, or not."""
-    return retouched_beam_state if retouched else beam_state
+def slewed_beam_state(
+    path: Toolpath, times: np.ndarray, state: np.ndarray, slew_tau: float
+) -> np.ndarray:
+    """``state`` with the heading relaxed into each corner rather than snapped.
+
+    Rosenthal's wake points down the direction of travel, so at a node where the
+    path turns it rotates by the whole turn between one stored time and the next.
+    Measured on the beam-centred window, the gate is identical from step to step
+    down a straight track and moves by the full normalised peak -- 0.98 at 90
+    degrees, 1.00 at 180 -- across every corner: 8 of ``serpentine``'s steps, 8 of
+    ``spiral``'s and 13 of ``nested_l``'s.
+
+    The plate does not do that. The trail behind a beam that has just turned still
+    lies along the leg it came down, because that is where the beam was. So the
+    heading the gate is drawn with *lags*: it starts each segment pointing the way
+    the previous lit segment did and relaxes to the new one as
+    ``1 - exp(-dt / slew_tau)``. Lagging rather than leading is the whole point --
+    turning early would aim the wake down a leg the beam has not travelled yet.
+
+    Only the direction moves. ``|v|`` is untouched, so the series keeps the
+    suppression that normalises its peak to 1; see :func:`retouched_beam_state` for
+    what happens to a moving-source gate when the speed itself is taken to zero.
+
+    The previous *lit* segment is the reference, not simply the previous one: a
+    segment travelled dark deposits nothing and leaves no trail to lag behind.
+    """
+    if slew_tau <= 0.0:
+        return state
+    on = np.asarray(path.on, dtype=bool)
+    if on.sum() < 2:
+        return state
+
+    t = np.asarray(times, dtype=float)
+    held = np.clip(t, 0.0, path.duration)
+    segment = np.clip(
+        np.searchsorted(path.t_nodes, held, side="right") - 1, 0, len(on) - 1
+    )
+
+    step = path.nodes[1:] - path.nodes[:-1]
+    heading = np.arctan2(step[:, 1], step[:, 0])
+
+    # `previous[i]` is the most recent lit segment *strictly* before segment i --
+    # the accumulate below includes i itself, so it is shifted by one.
+    seen = np.where(on, np.arange(len(on)), -1)
+    np.maximum.accumulate(seen, out=seen)
+    previous = np.concatenate([[-1], seen[:-1]])
+
+    slew = on[segment] & (previous[segment] >= 0) & (t <= path.duration)
+    if not slew.any():
+        return state
+
+    here = segment[slew]
+    before = heading[previous[here]]
+    turn = (heading[here] - before + np.pi) % (2.0 * np.pi) - np.pi
+    weight = 1.0 - np.exp(-(t[slew] - path.t_nodes[here]) / slew_tau)
+    angle = before + turn * weight
+
+    out = state.copy()
+    speed = np.hypot(state[slew, 3], state[slew, 4])
+    out[slew, 3] = speed * np.cos(angle)
+    out[slew, 4] = speed * np.sin(angle)
+    return out
+
+
+def beam_of(
+    retouched: bool = False,
+    dark_tau: float = 0.0,
+    slewed: bool = False,
+    slew_tau: float = 0.0,
+):
+    """The beam-state function a model wants, as one callable ``(path, times)``.
+
+    Held over dark travel or tracking the head; faded over dark travel or not;
+    slewed into corners or snapped. Composed in that order, because the slew reads
+    the heading the hold has already decided on.
+    """
+
+    def state(path: Toolpath, times: np.ndarray) -> np.ndarray:
+        out = (
+            retouched_beam_state(path, times, dark_tau)
+            if retouched
+            else beam_state(path, times)
+        )
+        return slewed_beam_state(path, times, out, slew_tau) if slewed else out
+
+    return state
 
 
 def branch_vector(path: Toolpath, sensors: np.ndarray, retouched: bool = False) -> np.ndarray:
@@ -242,16 +372,18 @@ def branch_vector(path: Toolpath, sensors: np.ndarray, retouched: bool = False) 
 class GaussianGate(nn.Module):
     """``[batch, 1]`` unit-peak Gaussian riding on the beam, wherever the beam is.
 
-    ``coords`` is ``[batch, 4]`` of ``(x, y, z, t)`` and ``beam`` is ``[batch, 5]``
-    of ``(x_l, y_l, lit, v_x, v_y)`` at that row's time on that row's path -- the
+    ``coords`` is ``[batch, 4]`` of ``(x, y, z, t)`` and ``beam`` is ``[batch, 6]``
+    of ``(x_l, y_l, lit, v_x, v_y, q)`` at that row's time on that row's path -- the
     generalisation of ``models/gmlp/laser.py``, which could only ask
     ``LASER_START_X + SCAN_SPEED * t``.
 
-    Multiplied by ``lit``, so a segment travelled dark contributes no gate at all.
-    A Gaussian is a picture of the *source*; where there is no source there is
-    nothing for it to be a picture of, and the heat still on the plate is the
-    trail, which this shape does not describe. The learnable floor ``p`` the
-    network adds is what covers that.
+    Multiplied by ``q``, which is ``lit`` for every model but the retouched ones,
+    so a segment travelled dark contributes no gate at all. A Gaussian is a picture
+    of the *source*; where there is no source there is nothing for it to be a
+    picture of, and the heat still on the plate is the trail, which this shape does
+    not describe. The learnable floor ``p`` the network adds is what covers that.
+    A retouched model instead hands ``q`` the fading pool; see
+    :func:`retouched_beam_state`.
     """
 
     radius: Tensor
@@ -270,14 +402,14 @@ class GaussianGate(nn.Module):
             + (coords[:, 1:2] - beam[:, 1:2]) ** 2
             + (coords[:, 2:3] - self.surface_z) ** 2
         )
-        return beam[:, 2:3] * torch.exp(
+        return beam[:, 5:6] * torch.exp(
             -2.0 * self.exponent_scale * squared / self.radius**2
         )
 
     def sequence(self, xyz: Tensor, beam: Tensor) -> Tensor:
         """``[B, Nt]`` -- the same gate at every stored time, for a fixed point.
 
-        ``xyz`` is ``[B, 3]`` and ``beam`` is ``[Nt, 5]``: one point, the whole
+        ``xyz`` is ``[B, 3]`` and ``beam`` is ``[Nt, 6]``: one point, the whole
         clock. A model that returns a temperature history needs a gate that is
         also a history, and the beam has moved between every entry of it.
         """
@@ -286,7 +418,7 @@ class GaussianGate(nn.Module):
             + (xyz[:, 1:2] - beam[None, :, 1]) ** 2
             + (xyz[:, 2:3] - self.surface_z) ** 2
         )
-        return beam[None, :, 2] * torch.exp(
+        return beam[None, :, 5] * torch.exp(
             -2.0 * self.exponent_scale * squared / self.radius**2
         )
 
@@ -397,7 +529,7 @@ class MovingSourceGate(nn.Module):
             self.thickness,
             self.images,
         )
-        return beam[:, 2:3] * field / self.peak
+        return beam[:, 5:6] * field / self.peak
 
     def sequence(self, xyz: Tensor, beam: Tensor) -> Tensor:
         """``[B, Nt]`` -- the wake at a fixed point, at every stored time.
@@ -425,7 +557,7 @@ class MovingSourceGate(nn.Module):
             self.thickness,
             self.images,
         ).squeeze(-1)
-        return beam[None, :, 2] * field / self.peak
+        return beam[None, :, 5] * field / self.peak
 
 
 GATES: dict[str, str] = {
@@ -452,15 +584,24 @@ GATES: dict[str, str] = {
     "rgfdon": "gaussian",
     "rjfdon": "moving_source",
     "rpkfdon": "none",
+    # The slewed pair: `jfdon` and `rjfdon` with the wake relaxed into each corner
+    # instead of snapped round it. Only the moving-source gate has a direction to
+    # get wrong, so only it has a slewed member. See `slewed_beam_state`.
+    "sjfdon": "moving_source",
+    "rsjfdon": "moving_source",
 }
 
 # Models whose beam frame is held over dark travel rather than tracking the head.
-RETOUCHED_MODELS = {"rfdon", "rgfdon", "rjfdon", "rpkfdon"}
+RETOUCHED_MODELS = {"rfdon", "rgfdon", "rjfdon", "rpkfdon", "rsjfdon"}
+
+# Models whose gate heading lags through a corner rather than turning with it.
+SLEWED_MODELS = {"sjfdon", "rsjfdon"}
 
 # Models whose trunk is `(x, y, z)` and whose output is `[B, Nt]`, trained on
 # `SequenceCorpus`.
 SEQUENCE_MODELS = {"fdon", "gfdon", "jfdon", "pkfdon",
-                   "rfdon", "rgfdon", "rjfdon", "rpkfdon"}
+                   "rfdon", "rgfdon", "rjfdon", "rpkfdon",
+                   "sjfdon", "rsjfdon"}
 
 # Models whose trunk takes `(along, across, z, t)` about the beam rather than
 # `(x, y, z, t)` on the plate, and which are therefore trained on `PatchCorpus`.
@@ -1112,6 +1253,9 @@ class SequenceCorpus:
         patterns: Sequence[str] | None = None,
         cede_radius: float = 0.0,
         retouched: bool = False,
+        dark_tau: float | None = None,
+        slewed: bool = False,
+        slew_tau: float | None = None,
     ) -> None:
         """``cede_radius > 0`` hides the beam's neighbourhood from the loss.
 
@@ -1134,8 +1278,15 @@ class SequenceCorpus:
         self.device, self.dtype = device, dtype
         self.cede_radius = float(cede_radius)
         self.retouched = bool(retouched)
-        beam_at = beam_of(self.retouched)
+        self.slewed = bool(slewed)
         self.physics = PathCorpus._physics(runs[0])
+        # Both default to the pool's own diffusion time rather than to a tuned
+        # number, and both are resolved here so the checkpoint can record what was
+        # actually used instead of what was asked for.
+        default_tau = dark_decay_time(self.physics)
+        self.dark_tau = float(default_tau if dark_tau is None else dark_tau)
+        self.slew_tau = float(default_tau if slew_tau is None else slew_tau)
+        beam_at = beam_of(self.retouched, self.dark_tau, self.slewed, self.slew_tau)
         self.train: list[dict] = []
         self.holdout: list[dict] = []
 
@@ -1354,6 +1505,39 @@ DEFAULT_RADIUS = 2.5e-3
 # point sums over a 0.25 mm spacing, so a node sitting exactly on the boundary
 # must not be lost to the last bit. A nanometre is far below the grid.
 NODE_TOLERANCE = 1e-9
+
+WINDOW_SHAPES = ("square", "circle")
+
+
+def check_window(window: str) -> str:
+    """The window shape, or a complaint naming the two that exist.
+
+    A square window turns with the beam, so at a corner its diagonal reaches
+    ``radius * sqrt(2)`` down a leg the round pool never gets to and the same
+    offset means a different distance from the beam depending on which way the
+    path happens to point. A circle is the same window at every heading, which is
+    the point of fitting in the beam's frame at all. It costs the corners:
+    ``1 - pi/4 = 21.5%`` of the lattice, and of whatever a base ceded as a square.
+    """
+    if window not in WINDOW_SHAPES:
+        raise ValueError(
+            f"unknown window shape {window!r}; have {', '.join(WINDOW_SHAPES)}"
+        )
+    return window
+
+
+def inside_window(along, across, radius: float, window: str):
+    """Which offsets the window covers -- the one test both the corpus and the agent use.
+
+    Shared rather than written twice: a patch fitted on a disc and pasted through
+    a square would answer for ground it was never shown, and nothing downstream
+    would say so.
+    """
+    if check_window(window) == "circle":
+        return along**2 + across**2 <= (radius + NODE_TOLERANCE) ** 2
+    return (abs(along) <= radius + NODE_TOLERANCE) & (
+        abs(across) <= radius + NODE_TOLERANCE
+    )
 
 
 def beam_frame(x: np.ndarray, y: np.ndarray, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1640,6 +1824,8 @@ class SequencePatchCorpus:
         dtype: torch.dtype,
         patterns: Sequence[str] | None = None,
         retouched: bool = False,
+        dark_tau: float | None = None,
+        window: str = "square",
     ) -> None:
         runs = sorted(p for p in directory.iterdir() if (p / "config.json").exists())
         if patterns is not None:
@@ -1649,7 +1835,11 @@ class SequencePatchCorpus:
 
         self.device, self.dtype, self.radius = device, dtype, radius
         self.retouched = bool(retouched)
+        self.window = check_window(window)
         self.physics = PathCorpus._physics(runs[0])
+        self.dark_tau = float(
+            dark_decay_time(self.physics) if dark_tau is None else dark_tau
+        )
         self.train: list[dict] = []
         self.holdout: list[dict] = []
 
@@ -1687,8 +1877,19 @@ class SequencePatchCorpus:
         depth = self.axes["z"] * MM
         gz, ga, gs = np.meshgrid(depth, offs, offs, indexing="ij")
         self.lattice = np.stack([ga.ravel(), gs.ravel(), gz.ravel()], axis=1)  # (M,3)
+        # A disc is cut from the square rather than laid out on its own, so the
+        # offsets that survive are the same offsets, at the same spacing, as the
+        # square window's -- the two differ by which rows exist and nothing else.
+        keep = inside_window(
+            self.lattice[:, 0], self.lattice[:, 1], self.radius, self.window
+        )
+        self.lattice = self.lattice[keep]
         self.points = self.lattice.shape[0]
         self.plate = (float(self.axes["x"][-1]) * MM, float(self.axes["y"][-1]) * MM)
+        print(
+            f"[data] window: {self.window}, {2e3 * self.radius:g} mm across, "
+            f"{self.points} offsets ({100 * keep.mean():.1f}% of the square lattice)"
+        )
 
         for pattern, power, nt, file, run_name in loaded:
             path = paths[run_name]
@@ -1739,7 +1940,9 @@ class SequencePatchCorpus:
         iz = np.rint(self.lattice[:, 2] / (self.axes["z"][1] - self.axes["z"][0]) / MM)
         iz = iz.astype(int)
 
-        states = beam_of(self.retouched)(path, np.arange(nt) * self.time_step)
+        states = beam_of(self.retouched, self.dark_tau)(
+            path, np.arange(nt) * self.time_step
+        )
         for k, state in enumerate(states):
             speed = float(np.hypot(state[3], state[4]))
             ux, uy = (1.0, 0.0) if speed <= 0 else (state[3] / speed, state[4] / speed)
@@ -1909,19 +2112,37 @@ class SequenceAgent(BaseAgent):
         device: torch.device | str = "cpu",
         chunk: int = 16384,
         retouched: bool = False,
+        dark_tau: float = 0.0,
+        slewed: bool = False,
+        slew_tau: float = 0.0,
     ) -> None:
         dtype = next(model.parameters()).dtype
         super().__init__(bounds, shape=shape, device=device, dtype=dtype, chunk=chunk)
         self.model = model.to(self.device).eval()
         self.path = path
         self.retouched = bool(retouched)
+        self.dark_tau = float(dark_tau)
+        self.slewed = bool(slewed)
+        self.slew_tau = float(slew_tau)
         self.times = torch.as_tensor(times, device=self.device, dtype=dtype)
         self.branch_path = torch.as_tensor(
             branch_vector(path, sensors, self.retouched), device=self.device, dtype=dtype
         )
         self.beam = torch.as_tensor(
-            beam_of(self.retouched)(path, np.asarray(times, dtype=float)),
+            self.beam_at(path, np.asarray(times, dtype=float)),
             device=self.device, dtype=dtype,
+        )
+
+    def beam_at(self, path: Toolpath, times: np.ndarray) -> np.ndarray:
+        """The beam state in the frame this agent's weights were fitted in.
+
+        Every flag that decides it is restored from the checkpoint, so an agent
+        cannot be built in a frame the model never saw -- which is the one failure
+        mode of this family that reads as a merely worse model rather than as an
+        error.
+        """
+        return beam_of(self.retouched, self.dark_tau, self.slewed, self.slew_tau)(
+            path, times
         )
 
     @torch.no_grad()
@@ -1959,14 +2180,21 @@ class SequencePatchAgent(SequenceAgent):
     caller passes and gets is still ``(x, y, z, t, P) -> K``.
     """
 
-    def __init__(self, *args, radius: float = DEFAULT_RADIUS, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        radius: float = DEFAULT_RADIUS,
+        window: str = "square",
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.radius = float(radius)
+        self.window = check_window(window)
 
     def frame(self, block: Tensor) -> tuple[Tensor, Tensor]:
         """``(offsets[B, 3], inside[B])`` for ``[B, 5]`` plate rows."""
         state = torch.as_tensor(
-            beam_of(self.retouched)(self.path, block[:, 3].detach().cpu().numpy()),
+            self.beam_at(self.path, block[:, 3].detach().cpu().numpy()),
             device=self.device, dtype=self.dtype,
         )
         speed = torch.linalg.vector_norm(state[:, 3:5], dim=1, keepdim=True).clamp_min(1e-12)
@@ -1976,9 +2204,7 @@ class SequencePatchAgent(SequenceAgent):
 
         along = dx * unit_x + dy * unit_y
         across = -dx * unit_y + dy * unit_x
-        inside = (along.abs() <= self.radius + NODE_TOLERANCE) & (
-            across.abs() <= self.radius + NODE_TOLERANCE
-        )
+        inside = inside_window(along, across, self.radius, self.window)
         return torch.cat([along, across, block[:, 2:3]], dim=1), inside.squeeze(1)
 
     @torch.no_grad()
@@ -1997,8 +2223,13 @@ class SequencePatchAgent(SequenceAgent):
         return torch.cat(outputs)
 
     def patch_box(self, time: float) -> np.ndarray:
-        """The four corners of the pasted square at ``time``, ``[4, 2]`` in metres."""
-        state = beam_of(self.retouched)(self.path, np.array([float(time)]))[0]
+        """The outline of what is pasted at ``time``, ``[N, 2]`` in metres.
+
+        Four corners for a square window and a polygon fine enough to read as a
+        circle for a disc -- either way it is the boundary of what ``frame`` calls
+        inside, so the figure cannot claim ground the paste never touched.
+        """
+        state = self.beam_at(self.path, np.array([float(time)]))[0]
         speed = float(np.hypot(state[3], state[4]))
         unit = (
             np.array([1.0, 0.0]) if speed <= 0.0
@@ -2006,9 +2237,13 @@ class SequencePatchAgent(SequenceAgent):
         )
         normal = np.array([-unit[1], unit[0]])
         centre = np.array([state[0], state[1]])
+        if self.window == "circle":
+            turn = np.linspace(0.0, 2.0 * np.pi, 65)[:-1]
+            offsets = [(np.cos(a), np.sin(a)) for a in turn]
+        else:
+            offsets = ((-1, -1), (1, -1), (1, 1), (-1, 1))
         return np.stack(
-            [centre + self.radius * (a * unit + b * normal)
-             for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            [centre + self.radius * (a * unit + b * normal) for a, b in offsets]
         )
 
 
@@ -2049,6 +2284,17 @@ class GenericPeakCorrectedAgent(BaseAgent):
             raise ValueError(
                 f"base ceded a {2e3 * ceded:g} mm square but the patch covers "
                 f"{2e3 * patch.radius:g} mm; they must match"
+            )
+        # The radii agree; the shapes need not. `--cede-radius` drops a square and
+        # a disc of the same half-width sits inside it, so the four corners are
+        # ceded by the base and not covered by the patch -- 21.5% of the window
+        # answered by a model that was trained never to look there. Said out loud
+        # because the output gives no sign of it.
+        if ceded > 0.0 and getattr(patch, "window", "square") == "circle":
+            print(
+                f"[warn] the base ceded a {2e3 * ceded:g} mm square and the patch "
+                f"covers the {2e3 * patch.radius:g} mm disc inside it: the corners, "
+                f"21.5% of the window, are learned by neither"
             )
         self.base, self.patch = base, patch
         self.path = base.path
@@ -2197,19 +2443,28 @@ def build_agent(
     if "times" in payload:
         model = SequenceDeepONet(**payload["architecture"])
         model.load_state_dict(payload["model"])
-        retouched = bool(payload.get("retouched", False))
+        # Every flag that moves the beam frame rides in the checkpoint. A model
+        # evaluated in a frame it was not fitted in reads as a bad model and
+        # nothing else, so none of these may be guessed at from the model name.
+        frame = dict(
+            retouched=bool(payload.get("retouched", False)),
+            dark_tau=float(payload.get("dark_tau", 0.0)),
+            slewed=bool(payload.get("slewed", False)),
+            slew_tau=float(payload.get("slew_tau", 0.0)),
+        )
         if "radius" in payload:
             return SequencePatchAgent(
                 model, path, np.asarray(payload["sensors"], dtype=float),
                 np.asarray(payload["times"], dtype=float), payload["bounds"],
                 shape=tuple(shape or payload["field_shape"]), device=device,
-                radius=float(payload["radius"]), retouched=retouched,
+                radius=float(payload["radius"]),
+                window=str(payload.get("window", "square")), **frame,
             )
         agent = SequenceAgent(
             model, path, np.asarray(payload["sensors"], dtype=float),
             np.asarray(payload["times"], dtype=float), payload["bounds"],
             shape=tuple(shape or payload["field_shape"]), device=device,
-            retouched=retouched,
+            **frame,
         )
         agent.cede_radius = float(payload.get("cede_radius", 0.0))
         return agent
@@ -2257,6 +2512,22 @@ def parse_args(model_name: str, doc: str, argv: list[str] | None) -> argparse.Na
                         help="patch models only: half-width in metres of the "
                              "window kept about the beam, along and across its "
                              f"travel (default: {DEFAULT_RADIUS})")
+    parser.add_argument("--shape", choices=WINDOW_SHAPES, default="square",
+                        help="sequence patch models only: the window's shape in "
+                             "the beam frame. A square turns with the beam and so "
+                             "reaches further down some headings than others; a "
+                             "circle is the same window whichever way the path "
+                             "points, at the cost of 21.5%% of the lattice "
+                             "(default: square)")
+    parser.add_argument("--dark-tau", type=float, default=None,
+                        help="retouched models only: the time constant in seconds "
+                             "the gate's amplitude fades on once the laser cuts "
+                             "out, as (tau / (dt + tau))^1.5. Defaults to the "
+                             "pool's own diffusion time a^2 / 4a, 0.196 s here")
+    parser.add_argument("--slew-tau", type=float, default=None,
+                        help="slewed models only: the time constant in seconds the "
+                             "gate's heading relaxes into a corner on. Defaults to "
+                             "the same diffusion time")
     parser.add_argument("--sensors", type=int, default=DEFAULT_SENSORS,
                         help="times the branch reads the toolpath at")
     parser.add_argument("--iterations", type=int, default=40000)
@@ -2305,6 +2576,12 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
     patching = model_name in PATCH_MODELS
     sequence = model_name in SEQUENCE_MODELS
     retouched = model_name in RETOUCHED_MODELS
+    slewed = model_name in SLEWED_MODELS
+    if args.shape != "square" and not (patching and sequence):
+        raise SystemExit(
+            f"--shape is the sequence patch window's, and {model_name} has none; "
+            f"it is for {', '.join(sorted(PATCH_MODELS & SEQUENCE_MODELS))}"
+        )
     common = dict(
         holdout_power=args.holdout, sensors=args.sensors,
         val_fraction=args.val_fraction, generator=generator,
@@ -2312,13 +2589,15 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
     )
     if patching and sequence:
         corpus = SequencePatchCorpus(
-            args.data_dir, radius=args.radius, retouched=retouched, **common
+            args.data_dir, radius=args.radius, retouched=retouched,
+            dark_tau=args.dark_tau, window=args.shape, **common
         )
     elif patching:
         corpus = PatchCorpus(args.data_dir, radius=args.radius, **common)
     elif sequence:
         corpus = SequenceCorpus(
-            args.data_dir, cede_radius=args.cede_radius, retouched=retouched, **common
+            args.data_dir, cede_radius=args.cede_radius, retouched=retouched,
+            dark_tau=args.dark_tau, slewed=slewed, slew_tau=args.slew_tau, **common
         )
     else:
         corpus = PathCorpus(args.data_dir, **common)
@@ -2528,8 +2807,16 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
                     "holdout_rmse": held,
                     "holdout_power": args.holdout,
                     **({"radius": args.radius} if patching else {}),
+                    **({"window": corpus.window} if patching and sequence else {}),
                     **({"times": corpus.times.tolist()} if sequence else {}),
-                    **({"retouched": True} if retouched else {}),
+                    # The resolved values, not the flags: `--dark-tau` and
+                    # `--slew-tau` both default to a number read off the physics,
+                    # and an agent has to rebuild the frame the weights were
+                    # fitted in rather than the one today's default would give.
+                    **({"retouched": True, "dark_tau": corpus.dark_tau}
+                       if retouched else {}),
+                    **({"slewed": True, "slew_tau": corpus.slew_tau}
+                       if slewed else {}),
                     # What a ceded base gave up. Without it nothing can check
                     # that the patch it is paired with covers the same square,
                     # and a mismatch leaves either a ring neither model learned
