@@ -44,10 +44,11 @@ from matplotlib.figure import Figure
 from dataset import MM, Grid, find_grid
 from models import build_agent
 from models._pathdon import (
-    DEFAULT_TOOLPATH_DIR, GATES, PATCH_MODELS, SEQUENCE_MODELS
+    DEFAULT_TOOLPATH_DIR, GATES, PATCH_MODELS, RETOUCHED_MODELS, SEQUENCE_MODELS
 )
 import models.pkdon
 import models.pkfdon
+import models.rpkfdon
 from utils import load_checkpoint, resolve_device, resolve_figure_path
 from visualize import predict, slice_coords
 
@@ -371,11 +372,17 @@ def main() -> None:
                 # interchangeable: `pkdon` answers one instant at a time,
                 # `pkfdon` answers a history, and both are only meaningful
                 # pasted over a base that speaks the same way.
-                family = "pkfdon" if model in SEQUENCE_MODELS else "pkdon"
-                paste = (
-                    models.pkfdon.peak_corrected if model in SEQUENCE_MODELS
-                    else models.pkdon.peak_corrected
-                )
+                # Three patches now, and they are not interchangeable: `pkdon`
+                # answers one instant at a time, `pkfdon` answers a history, and
+                # `rpkfdon` answers a history in a frame that stops for dark
+                # travel. Each is only meaningful over a base that speaks the
+                # same way, and `GenericPeakCorrectedAgent` refuses the rest.
+                if model in RETOUCHED_MODELS:
+                    family, paste = "rpkfdon", models.rpkfdon.peak_corrected
+                elif model in SEQUENCE_MODELS:
+                    family, paste = "pkfdon", models.pkfdon.peak_corrected
+                else:
+                    family, paste = "pkdon", models.pkdon.peak_corrected
                 patch = (
                     Path(args.pkcorrect) if args.pkcorrect
                     else latest_checkpoint(family, args.tag)
@@ -396,11 +403,15 @@ def main() -> None:
                           sources + [f"patch: {s}" for s in sorted(patches)]),
                       patch_models=patch_models)
         if args.pkcorrect is not None:
-            family = (
-                "pkfdon" if all(m in SEQUENCE_MODELS for m in args.model)
-                else "pkdon" if not any(m in SEQUENCE_MODELS for m in args.model)
-                else "pk-mixed"
-            )
+            if all(m in RETOUCHED_MODELS for m in args.model):
+                family = "rpkfdon"
+            elif all(m in SEQUENCE_MODELS and m not in RETOUCHED_MODELS
+                     for m in args.model):
+                family = "pkfdon"
+            elif not any(m in SEQUENCE_MODELS for m in args.model):
+                family = "pkdon"
+            else:
+                family = "pk-mixed"
         elif list(args.model) == POINTWISE:
             family = "don"
         else:

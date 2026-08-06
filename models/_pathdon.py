@@ -137,7 +137,85 @@ def beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
     )
 
 
-def branch_vector(path: Toolpath, sensors: np.ndarray) -> np.ndarray:
+def retouched_beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
+    """:func:`beam_state`, but the beam does not move while the laser is off.
+
+    Over a dark segment the head is travelling to the next track at 30 mm/s and
+    depositing nothing. The plain beam state follows it, which makes two things
+    wrong at once for the models built on it:
+
+    * a window that rides with the head is somewhere with no melt pool in it,
+      while the pool it *should* be describing sits cooling where the laser was
+      last on;
+    * the gates multiply by ``lit``, so they go to zero and the models have no
+      shape at all for that pool -- 22% of ``raster``'s run and 16% of
+      ``nested_l``'s is spent this way, and all of it is currently a blind spot.
+
+    Here the position, the heading and the speed are all held at their last lit
+    values, and ``lit`` is held at 1. The frame stops tracking the head and starts
+    tracking the pool, which is the thing every model downstream is actually
+    trying to describe. Nothing is frozen *before* the first lit instant or after
+    the scan ends: there is no pool yet in the first case, and the run is over in
+    the second.
+
+    This is the only difference between the ``r*`` family and the rest.
+    """
+    state = beam_state(path, times)
+    t = np.asarray(times, dtype=float)
+
+    # Where the pool is must be a property of the *path* and the query time, not
+    # of which other times happen to be in the same array. Forward-filling over
+    # the samples looks equivalent and is not: ask for one dark instant on its
+    # own and there is no earlier lit sample in the array to fill from, so the
+    # answer silently falls back to the tracking beam. That is exactly how the
+    # agents query it -- one instant per call, or one time repeated over a whole
+    # slice -- so the models trained in a held frame were being evaluated and
+    # plotted in a tracking one.
+    #
+    # So the fill is done over the path's own segments instead, once, and any
+    # query time then reads it directly.
+    on = np.asarray(path.on, dtype=bool)
+    if on.all() or not on.any():
+        return state  # a path that never lifts, or never fires
+
+    # `previous[i]` is the most recent lit segment at or before segment i.
+    previous = np.where(on, np.arange(len(on)), -1)
+    np.maximum.accumulate(previous, out=previous)
+
+    held = np.clip(t, 0.0, path.duration)
+    segment = np.clip(
+        np.searchsorted(path.t_nodes, held, side="right") - 1, 0, len(on) - 1
+    )
+    source = previous[segment]
+
+    # A dark segment with a lit one before it: hold the end of that lit segment,
+    # travelling as it was. Everything else -- lit now, or dark before the laser
+    # has ever fired -- keeps the plain state, and so does anything past the end
+    # of the scan, where the run is simply over.
+    hold = ~on[segment] & (source >= 0) & (t <= path.duration)
+    if not hold.any():
+        return state
+
+    out = state.copy()
+    i = source[hold]
+    step = path.nodes[i + 1] - path.nodes[i]
+    length = np.hypot(step[:, 0], step[:, 1])
+    speed = path.speed[i]
+
+    out[hold, 0] = path.nodes[i + 1, 0] * MM
+    out[hold, 1] = path.nodes[i + 1, 1] * MM
+    out[hold, 2] = 1.0  # the pool is there whether or not the laser is
+    out[hold, 3] = step[:, 0] / length * speed * MM
+    out[hold, 4] = step[:, 1] / length * speed * MM
+    return out
+
+
+def beam_of(retouched: bool):
+    """The beam-state function a model wants: held over dark travel, or not."""
+    return retouched_beam_state if retouched else beam_state
+
+
+def branch_vector(path: Toolpath, sensors: np.ndarray, retouched: bool = False) -> np.ndarray:
     """``[3 * len(sensors)]`` -- the path read at fixed times, the DeepONet way.
 
     A branch network takes the input function sampled at a fixed set of sensors.
@@ -152,7 +230,7 @@ def branch_vector(path: Toolpath, sensors: np.ndarray) -> np.ndarray:
     its last node with ``lit = 0`` (:meth:`Toolpath.position`), so "this scan
     finished a second before that one" is something the branch can read off.
     """
-    state = beam_state(path, sensors)
+    state = beam_of(retouched)(path, sensors)
     return state[:, 0:3].reshape(-1)
 
 
@@ -367,15 +445,26 @@ GATES: dict[str, str] = {
     "jfdon": "moving_source",
     # The sequence family's patch: `pkdon` is to `don` as this is to `fdon`.
     "pkfdon": "none",
+    # The retouched family: identical to the four above except that the beam
+    # frame stops following the head while the laser is off and holds the pool
+    # it last made. See `retouched_beam_state`.
+    "rfdon": "none",
+    "rgfdon": "gaussian",
+    "rjfdon": "moving_source",
+    "rpkfdon": "none",
 }
+
+# Models whose beam frame is held over dark travel rather than tracking the head.
+RETOUCHED_MODELS = {"rfdon", "rgfdon", "rjfdon", "rpkfdon"}
 
 # Models whose trunk is `(x, y, z)` and whose output is `[B, Nt]`, trained on
 # `SequenceCorpus`.
-SEQUENCE_MODELS = {"fdon", "gfdon", "jfdon", "pkfdon"}
+SEQUENCE_MODELS = {"fdon", "gfdon", "jfdon", "pkfdon",
+                   "rfdon", "rgfdon", "rjfdon", "rpkfdon"}
 
 # Models whose trunk takes `(along, across, z, t)` about the beam rather than
 # `(x, y, z, t)` on the plate, and which are therefore trained on `PatchCorpus`.
-PATCH_MODELS = {"pkdon", "pkfdon"}
+PATCH_MODELS = {"pkdon", "pkfdon", "rpkfdon"}
 
 
 def build_gate(kind: str, physics: dict, exponent_scale: float) -> nn.Module | None:
@@ -1022,6 +1111,7 @@ class SequenceCorpus:
         dtype: torch.dtype,
         patterns: Sequence[str] | None = None,
         cede_radius: float = 0.0,
+        retouched: bool = False,
     ) -> None:
         """``cede_radius > 0`` hides the beam's neighbourhood from the loss.
 
@@ -1043,6 +1133,8 @@ class SequenceCorpus:
 
         self.device, self.dtype = device, dtype
         self.cede_radius = float(cede_radius)
+        self.retouched = bool(retouched)
+        beam_at = beam_of(self.retouched)
         self.physics = PathCorpus._physics(runs[0])
         self.train: list[dict] = []
         self.holdout: list[dict] = []
@@ -1059,7 +1151,8 @@ class SequenceCorpus:
         for run in runs:
             path = paths[run.name]
             branch = torch.as_tensor(
-                branch_vector(path, self.sensors), device=device, dtype=dtype
+                branch_vector(path, self.sensors, self.retouched),
+                device=device, dtype=dtype,
             )
             for file in sorted(run.glob("data_*W.npy")):
                 rows = np.load(file, mmap_mode="r")
@@ -1107,7 +1200,7 @@ class SequenceCorpus:
                 "pattern": pattern, "power": power, "path": path, "branch": branch,
                 "field": field, "nt": nt,
                 "beam": torch.as_tensor(
-                    beam_state(path, np.arange(self.nt) * self.time_step),
+                    beam_at(path, np.arange(self.nt) * self.time_step),
                     device=device, dtype=dtype,
                 ),
             }
@@ -1546,6 +1639,7 @@ class SequencePatchCorpus:
         device: torch.device,
         dtype: torch.dtype,
         patterns: Sequence[str] | None = None,
+        retouched: bool = False,
     ) -> None:
         runs = sorted(p for p in directory.iterdir() if (p / "config.json").exists())
         if patterns is not None:
@@ -1554,6 +1648,7 @@ class SequencePatchCorpus:
             raise FileNotFoundError(f"no solver runs under {directory}")
 
         self.device, self.dtype, self.radius = device, dtype, radius
+        self.retouched = bool(retouched)
         self.physics = PathCorpus._physics(runs[0])
         self.train: list[dict] = []
         self.holdout: list[dict] = []
@@ -1605,7 +1700,8 @@ class SequencePatchCorpus:
             condition = {
                 "pattern": pattern, "power": power, "path": path, "nt": nt,
                 "branch": torch.as_tensor(
-                    branch_vector(path, self.sensors), device=device, dtype=dtype
+                    branch_vector(path, self.sensors, self.retouched),
+                    device=device, dtype=dtype,
                 ),
                 "target": torch.as_tensor(target, device=device).to(dtype),
                 "mask": torch.as_tensor(mask, device=device).to(dtype),
@@ -1643,7 +1739,7 @@ class SequencePatchCorpus:
         iz = np.rint(self.lattice[:, 2] / (self.axes["z"][1] - self.axes["z"][0]) / MM)
         iz = iz.astype(int)
 
-        states = beam_state(path, np.arange(nt) * self.time_step)
+        states = beam_of(self.retouched)(path, np.arange(nt) * self.time_step)
         for k, state in enumerate(states):
             speed = float(np.hypot(state[3], state[4]))
             ux, uy = (1.0, 0.0) if speed <= 0 else (state[3] / speed, state[4] / speed)
@@ -1812,17 +1908,19 @@ class SequenceAgent(BaseAgent):
         shape: tuple[int, int, int],
         device: torch.device | str = "cpu",
         chunk: int = 16384,
+        retouched: bool = False,
     ) -> None:
         dtype = next(model.parameters()).dtype
         super().__init__(bounds, shape=shape, device=device, dtype=dtype, chunk=chunk)
         self.model = model.to(self.device).eval()
         self.path = path
+        self.retouched = bool(retouched)
         self.times = torch.as_tensor(times, device=self.device, dtype=dtype)
         self.branch_path = torch.as_tensor(
-            branch_vector(path, sensors), device=self.device, dtype=dtype
+            branch_vector(path, sensors, self.retouched), device=self.device, dtype=dtype
         )
         self.beam = torch.as_tensor(
-            beam_state(path, np.asarray(times, dtype=float)),
+            beam_of(self.retouched)(path, np.asarray(times, dtype=float)),
             device=self.device, dtype=dtype,
         )
 
@@ -1868,7 +1966,7 @@ class SequencePatchAgent(SequenceAgent):
     def frame(self, block: Tensor) -> tuple[Tensor, Tensor]:
         """``(offsets[B, 3], inside[B])`` for ``[B, 5]`` plate rows."""
         state = torch.as_tensor(
-            beam_state(self.path, block[:, 3].detach().cpu().numpy()),
+            beam_of(self.retouched)(self.path, block[:, 3].detach().cpu().numpy()),
             device=self.device, dtype=self.dtype,
         )
         speed = torch.linalg.vector_norm(state[:, 3:5], dim=1, keepdim=True).clamp_min(1e-12)
@@ -1900,7 +1998,7 @@ class SequencePatchAgent(SequenceAgent):
 
     def patch_box(self, time: float) -> np.ndarray:
         """The four corners of the pasted square at ``time``, ``[4, 2]`` in metres."""
-        state = beam_state(self.path, np.array([float(time)]))[0]
+        state = beam_of(self.retouched)(self.path, np.array([float(time)]))[0]
         speed = float(np.hypot(state[3], state[4]))
         unit = (
             np.array([1.0, 0.0]) if speed <= 0.0
@@ -1938,6 +2036,14 @@ class GenericPeakCorrectedAgent(BaseAgent):
         # paste either leaves a ring neither model ever learned (cede larger) or
         # overwrites ground the base did learn (cede smaller). Neither is
         # detectable in the output -- it just reads as a worse model.
+        if bool(getattr(base, "retouched", False)) != bool(
+            getattr(patch, "retouched", False)
+        ):
+            raise ValueError(
+                "one of base and patch holds the beam over dark travel and the "
+                "other follows the head; their windows are in different places "
+                "whenever the laser is off"
+            )
         ceded = float(getattr(base, "cede_radius", 0.0))
         if ceded > 0.0 and abs(ceded - patch.radius) > 1e-9:
             raise ValueError(
@@ -2091,17 +2197,19 @@ def build_agent(
     if "times" in payload:
         model = SequenceDeepONet(**payload["architecture"])
         model.load_state_dict(payload["model"])
+        retouched = bool(payload.get("retouched", False))
         if "radius" in payload:
             return SequencePatchAgent(
                 model, path, np.asarray(payload["sensors"], dtype=float),
                 np.asarray(payload["times"], dtype=float), payload["bounds"],
                 shape=tuple(shape or payload["field_shape"]), device=device,
-                radius=float(payload["radius"]),
+                radius=float(payload["radius"]), retouched=retouched,
             )
         agent = SequenceAgent(
             model, path, np.asarray(payload["sensors"], dtype=float),
             np.asarray(payload["times"], dtype=float), payload["bounds"],
             shape=tuple(shape or payload["field_shape"]), device=device,
+            retouched=retouched,
         )
         agent.cede_radius = float(payload.get("cede_radius", 0.0))
         return agent
@@ -2196,17 +2304,22 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
 
     patching = model_name in PATCH_MODELS
     sequence = model_name in SEQUENCE_MODELS
+    retouched = model_name in RETOUCHED_MODELS
     common = dict(
         holdout_power=args.holdout, sensors=args.sensors,
         val_fraction=args.val_fraction, generator=generator,
         device=device, dtype=dtype, patterns=args.patterns,
     )
     if patching and sequence:
-        corpus = SequencePatchCorpus(args.data_dir, radius=args.radius, **common)
+        corpus = SequencePatchCorpus(
+            args.data_dir, radius=args.radius, retouched=retouched, **common
+        )
     elif patching:
         corpus = PatchCorpus(args.data_dir, radius=args.radius, **common)
     elif sequence:
-        corpus = SequenceCorpus(args.data_dir, cede_radius=args.cede_radius, **common)
+        corpus = SequenceCorpus(
+            args.data_dir, cede_radius=args.cede_radius, retouched=retouched, **common
+        )
     else:
         corpus = PathCorpus(args.data_dir, **common)
     domain = corpus.domain
@@ -2416,6 +2529,7 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
                     "holdout_power": args.holdout,
                     **({"radius": args.radius} if patching else {}),
                     **({"times": corpus.times.tolist()} if sequence else {}),
+                    **({"retouched": True} if retouched else {}),
                     # What a ceded base gave up. Without it nothing can check
                     # that the patch it is paired with covers the same square,
                     # and a mismatch leaves either a ring neither model learned

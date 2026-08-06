@@ -72,12 +72,19 @@ def window_of(payload: dict) -> tuple[Tensor, dict]:
 
 
 def windows_agree(a: Tensor, b: Tensor, tolerance: float = NODE_TOLERANCE) -> bool:
-    """Whether two ``[4, 2]`` windows are the same box to within a node tolerance."""
-    return bool(torch.allclose(
-        torch.as_tensor(a, dtype=torch.float64),
-        torch.as_tensor(b, dtype=torch.float64),
-        atol=tolerance, rtol=0.0,
-    ))
+    """Whether two ``[4, 2]`` windows are the same box to within a node tolerance.
+
+    Both are pulled to the CPU in float64 first. One of them is a list read out of
+    a checkpoint and the other is a live agent's ``bounds``, which sits on whatever
+    device that agent was built on -- comparing them where they lie raises rather
+    than answers.
+    """
+    def box(v):
+        return torch.as_tensor(v, dtype=torch.float64, device="cpu") if not isinstance(
+            v, Tensor
+        ) else v.detach().to(device="cpu", dtype=torch.float64)
+
+    return bool(torch.allclose(box(a), box(b), atol=tolerance, rtol=0.0))
 
 
 def cede_patch_window(
