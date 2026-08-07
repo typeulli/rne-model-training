@@ -88,6 +88,21 @@ AMBIENT_TEMPERATURE = 298.0
 # The branch reads the path at this many fixed times. See `branch_vector`.
 DEFAULT_SENSORS = 64
 
+# Which segment a time lands in is decided by `searchsorted(..., 'right')`, so a
+# time sitting exactly on a node belongs to the segment that *starts* there. The
+# corpus asks in float64 and gets that; an agent asks with a time that has been
+# through the model's float32, and `21 * 0.4` comes back as 8.399999618530273 --
+# 4e-7 s early, and therefore one segment early. On `serpentine` that is the node
+# at t = 8.4 where the path turns 180 degrees, so the window was drawn facing
+# backwards for that whole snapshot: 133 K of error in it against 2.5 K in every
+# other. `spiral` has four such nodes, `raster` and `nested_l` none, which is
+# exactly where the damage showed up.
+#
+# A microsecond is four orders below the shortest segment here (0.1 s) and three
+# above the float32 error, so nudging the lookup by it puts a node-time back on
+# the segment the corpus trained it on.
+TIME_TOLERANCE = 1e-6
+
 # `utils.DEFAULT_LR` is 1e-3 for adam, and every other model here is four layers
 # wide. These are six, and at 1e-3 all three diverge -- not gently: iteration
 # 8000 of a `don` run went to a 17000 K validation error, with the gradients
@@ -124,7 +139,8 @@ def beam_state(path: Toolpath, times: np.ndarray) -> np.ndarray:
     t = np.asarray(times, dtype=float)
     held = np.clip(t, 0.0, path.duration)
     index = np.clip(
-        np.searchsorted(path.t_nodes, held, side="right") - 1, 0, len(path.on) - 1
+        np.searchsorted(path.t_nodes, held + TIME_TOLERANCE, side="right") - 1,
+        0, len(path.on) - 1,
     )
 
     x, y, lit = path.position(t)
@@ -222,7 +238,8 @@ def retouched_beam_state(
 
     held = np.clip(t, 0.0, path.duration)
     segment = np.clip(
-        np.searchsorted(path.t_nodes, held, side="right") - 1, 0, len(on) - 1
+        np.searchsorted(path.t_nodes, held + TIME_TOLERANCE, side="right") - 1,
+        0, len(on) - 1,
     )
     source = previous[segment]
 
@@ -250,7 +267,7 @@ def retouched_beam_state(
     # switched off -- the same node the position above was held at, so the clock
     # and the place agree by construction.
     if dark_tau > 0.0:
-        elapsed = t[hold] - path.t_nodes[i + 1]
+        elapsed = np.maximum(t[hold] - path.t_nodes[i + 1], 0.0)
         out[hold, 5] = (dark_tau / (elapsed + dark_tau)) ** 1.5
     else:
         out[hold, 5] = 1.0
@@ -292,7 +309,8 @@ def slewed_beam_state(
     t = np.asarray(times, dtype=float)
     held = np.clip(t, 0.0, path.duration)
     segment = np.clip(
-        np.searchsorted(path.t_nodes, held, side="right") - 1, 0, len(on) - 1
+        np.searchsorted(path.t_nodes, held + TIME_TOLERANCE, side="right") - 1,
+        0, len(on) - 1,
     )
 
     step = path.nodes[1:] - path.nodes[:-1]
@@ -311,7 +329,9 @@ def slewed_beam_state(
     here = segment[slew]
     before = heading[previous[here]]
     turn = (heading[here] - before + np.pi) % (2.0 * np.pi) - np.pi
-    weight = 1.0 - np.exp(-(t[slew] - path.t_nodes[here]) / slew_tau)
+    weight = 1.0 - np.exp(
+        -np.maximum(t[slew] - path.t_nodes[here], 0.0) / slew_tau
+    )
     angle = before + turn * weight
 
     out = state.copy()
@@ -1256,6 +1276,7 @@ class SequenceCorpus:
         dark_tau: float | None = None,
         slewed: bool = False,
         slew_tau: float | None = None,
+        window: str = "square",
     ) -> None:
         """``cede_radius > 0`` hides the beam's neighbourhood from the loss.
 
@@ -1277,6 +1298,9 @@ class SequenceCorpus:
 
         self.device, self.dtype = device, dtype
         self.cede_radius = float(cede_radius)
+        # The shape of the hole, which must be the shape of the patch that fills
+        # it. Kept next to the radius because the two are one decision.
+        self.cede_window = check_window(window)
         self.retouched = bool(retouched)
         self.slewed = bool(slewed)
         self.physics = PathCorpus._physics(runs[0])
@@ -1415,8 +1439,11 @@ class SequenceCorpus:
         mask = torch.zeros((count, self.nt), device=self.device, dtype=self.dtype)
         mask[:, : condition["nt"]] = 1.0
         if self.cede_radius > 0.0 and xyz is not None:
-            # Zero wherever the patch will answer instead: |along| and |across|
-            # within the window, resolved per stored time because it turns.
+            # Zero wherever the patch will answer instead, resolved per stored time
+            # because the window turns. Through the *same* test the patch owns its
+            # rows by: a square hole with a disc pasted into it leaves the four
+            # corners -- 21.5% of the window -- learned by neither model, and
+            # nothing downstream can see that from the output.
             beam = condition["beam"]
             speed = torch.linalg.vector_norm(beam[:, 3:5], dim=1).clamp_min(1e-12)
             ux, uy = beam[:, 3] / speed, beam[:, 4] / speed
@@ -1424,7 +1451,9 @@ class SequenceCorpus:
             dy = xyz[:, 1:2] - beam[None, :, 1]
             along = dx * ux[None] + dy * uy[None]
             across = -dx * uy[None] + dy * ux[None]
-            ceded = (along.abs() <= self.cede_radius) & (across.abs() <= self.cede_radius)
+            ceded = inside_window(
+                along, across, self.cede_radius, self.cede_window, tolerance=0.0
+            )
             mask = mask * (~ceded).to(mask.dtype)
         return mask
 
@@ -1526,18 +1555,26 @@ def check_window(window: str) -> str:
     return window
 
 
-def inside_window(along, across, radius: float, window: str):
+def inside_window(along, across, radius: float, window: str,
+                  tolerance: float = NODE_TOLERANCE):
     """Which offsets the window covers -- the one test both the corpus and the agent use.
 
     Shared rather than written twice: a patch fitted on a disc and pasted through
     a square would answer for ground it was never shown, and nothing downstream
     would say so.
+
+    ``tolerance`` is why a patch keeps the nodes sitting exactly on its boundary.
+    :meth:`SequenceCorpus._mask` passes 0 instead, and must: ``along`` there is a
+    float32 sum over plate-scale coordinates, so its own noise is about 2 nm --
+    the same size as the tolerance. Applying it moves 0.26% of the entries, all of
+    them on the window's edge where the error lives, and a ceded base's RMSE with
+    it is 3% below the same base's RMSE without. Nothing is lost by leaving it
+    off: the patch claiming a nanometre more than the base gave up is an overlap
+    the base also learned, not a gap.
     """
     if check_window(window) == "circle":
-        return along**2 + across**2 <= (radius + NODE_TOLERANCE) ** 2
-    return (abs(along) <= radius + NODE_TOLERANCE) & (
-        abs(across) <= radius + NODE_TOLERANCE
-    )
+        return along**2 + across**2 <= (radius + tolerance) ** 2
+    return (abs(along) <= radius + tolerance) & (abs(across) <= radius + tolerance)
 
 
 def beam_frame(x: np.ndarray, y: np.ndarray, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -2285,16 +2322,19 @@ class GenericPeakCorrectedAgent(BaseAgent):
                 f"base ceded a {2e3 * ceded:g} mm square but the patch covers "
                 f"{2e3 * patch.radius:g} mm; they must match"
             )
-        # The radii agree; the shapes need not. `--cede-radius` drops a square and
-        # a disc of the same half-width sits inside it, so the four corners are
-        # ceded by the base and not covered by the patch -- 21.5% of the window
-        # answered by a model that was trained never to look there. Said out loud
-        # because the output gives no sign of it.
-        if ceded > 0.0 and getattr(patch, "window", "square") == "circle":
+        # The radii agree; the shapes are checked separately because they are a
+        # separate decision and were once allowed to disagree. A square hole with
+        # a disc pasted into it leaves the four corners -- 21.5% of the window --
+        # to a base that was trained never to look there, and the output gives no
+        # sign of it. Said out loud rather than raised, so the two can still be
+        # paired deliberately and measured against a matched pair.
+        cede_shape = str(getattr(base, "cede_window", "square"))
+        patch_shape = str(getattr(patch, "window", "square"))
+        if ceded > 0.0 and cede_shape != patch_shape:
             print(
-                f"[warn] the base ceded a {2e3 * ceded:g} mm square and the patch "
-                f"covers the {2e3 * patch.radius:g} mm disc inside it: the corners, "
-                f"21.5% of the window, are learned by neither"
+                f"[warn] the base ceded a {2e3 * ceded:g} mm {cede_shape} and the "
+                f"patch covers the {2e3 * patch.radius:g} mm {patch_shape} in it: "
+                f"21.5% of the window is learned by neither"
             )
         self.base, self.patch = base, patch
         self.path = base.path
@@ -2467,6 +2507,7 @@ def build_agent(
             **frame,
         )
         agent.cede_radius = float(payload.get("cede_radius", 0.0))
+        agent.cede_window = str(payload.get("cede_window", "square"))
         return agent
 
     model = PathDeepONet(**payload["architecture"])
@@ -2513,12 +2554,14 @@ def parse_args(model_name: str, doc: str, argv: list[str] | None) -> argparse.Na
                              "window kept about the beam, along and across its "
                              f"travel (default: {DEFAULT_RADIUS})")
     parser.add_argument("--shape", choices=WINDOW_SHAPES, default="square",
-                        help="sequence patch models only: the window's shape in "
-                             "the beam frame. A square turns with the beam and so "
-                             "reaches further down some headings than others; a "
-                             "circle is the same window whichever way the path "
-                             "points, at the cost of 21.5%% of the lattice "
-                             "(default: square)")
+                        help="the shape of the window about the beam, in the beam "
+                             "frame: what a patch model covers, or what a base "
+                             "gives up to one with --cede-radius. A square turns "
+                             "with the beam and so reaches further down some "
+                             "headings than others; a circle is the same window "
+                             "whichever way the path points, at the cost of 21.5%% "
+                             "of it. Base and patch must agree, or the corners "
+                             "belong to neither (default: square)")
     parser.add_argument("--dark-tau", type=float, default=None,
                         help="retouched models only: the time constant in seconds "
                              "the gate's amplitude fades on once the laser cuts "
@@ -2577,10 +2620,14 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
     sequence = model_name in SEQUENCE_MODELS
     retouched = model_name in RETOUCHED_MODELS
     slewed = model_name in SLEWED_MODELS
-    if args.shape != "square" and not (patching and sequence):
+    if args.shape != "square" and not sequence:
         raise SystemExit(
-            f"--shape is the sequence patch window's, and {model_name} has none; "
-            f"it is for {', '.join(sorted(PATCH_MODELS & SEQUENCE_MODELS))}"
+            f"--shape is the sequence family's window, and {model_name} is not in it"
+        )
+    if args.shape != "square" and sequence and not patching and args.cede_radius <= 0:
+        raise SystemExit(
+            f"--shape says what {model_name} gives up to a patch, but it is not "
+            f"giving up anything; pass --cede-radius as well or drop --shape"
         )
     common = dict(
         holdout_power=args.holdout, sensors=args.sensors,
@@ -2597,7 +2644,8 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
     elif sequence:
         corpus = SequenceCorpus(
             args.data_dir, cede_radius=args.cede_radius, retouched=retouched,
-            dark_tau=args.dark_tau, slewed=slewed, slew_tau=args.slew_tau, **common
+            dark_tau=args.dark_tau, slewed=slewed, slew_tau=args.slew_tau,
+            window=args.shape, **common
         )
     else:
         corpus = PathCorpus(args.data_dir, **common)
@@ -2821,7 +2869,8 @@ def run(model_name: str, doc: str, argv: list[str] | None = None) -> None:
                     # that the patch it is paired with covers the same square,
                     # and a mismatch leaves either a ring neither model learned
                     # or capacity spent on an answer that is discarded.
-                    **({"cede_radius": args.cede_radius}
+                    **({"cede_radius": args.cede_radius,
+                        "cede_window": corpus.cede_window}
                        if (sequence and not patching and args.cede_radius > 0) else {}),
                 },
                 step=iteration,
